@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
-from api.monitor import monitor
+from app.api.monitor import monitor
 
 load_dotenv()
 
@@ -60,12 +60,12 @@ def internet_search(
     )
 
 
-# if __name__ == "__main__":
-#     from pprint import pprint
+if __name__ == "__main__":
+    from pprint import pprint
 
-#     # 本地调试入口：直接运行本文件可验证 TAVILY_API_KEY 和 Tavily API 是否可用
-#     pprint(
-#         internet_search.invoke(
-#             {"query": "2026中国法定节假日放假安排表，我天天都想要放假"}
-#         )
-#     )
+    # 本地调试入口：直接运行本文件可验证 TAVILY_API_KEY 和 Tavily API 是否可用
+    pprint(
+        internet_search.invoke(
+            {"query": "2026中国法定节假日放假安排表，我天天都想要放假"}
+        )
+    )
