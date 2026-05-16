@@ -8,7 +8,7 @@
 -- 数据库查询助手会先查看真实表名，再读取表结构和样例数据，最后执行 SQL。
 --
 -- Docker 初始化说明：
--- 当 docs/docker-compose.yaml 把本文件挂载到 /docker-entrypoint-initdb.d/ 时，
+-- 当 docker/docker-compose.yaml 把本文件挂载到 /docker-entrypoint-initdb.d/ 时，
 -- MySQL 官方镜像只会在数据目录为空的第一次启动时执行本脚本。
 -- 如果已经启动过容器并生成了 volume，修改本文件后需要重建数据卷才会重新导入。
 --
