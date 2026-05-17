@@ -6,6 +6,7 @@
 session_id 创建独立工作目录，并把工具调用、子智能体调用和最终结果推送给前端。
 """
 
+import asyncio
 import shutil
 from pathlib import Path
 
@@ -141,6 +142,9 @@ async def run_deep_agent(task_query, session_id):
                             )
                             monitor.report_task_result(last_msg.content)
 
+    except asyncio.CancelledError:
+        monitor.report_task_cancelled()
+        raise
     except Exception as e:
         # 异步执行异常也走 monitor，保证前端能收到明确错误事件
         monitor._emit("error", f"执行主智能发生异常信息：{str(e)}")

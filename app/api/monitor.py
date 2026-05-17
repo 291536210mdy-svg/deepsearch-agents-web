@@ -127,6 +127,10 @@ class ToolMonitor:
         """报告任务最终结果"""
         self._emit("task_result", "任务执行完成", {"result": result})
 
+    def report_task_cancelled(self) -> None:
+        """报告任务已被用户取消"""
+        self._emit("task_cancelled", "任务已取消")
+
     def report_session_dir(self, path: str) -> None:
         """报告当前任务工作目录"""
         self._emit("session_created", f"工作目录已创建: {path}", {"path": path})
@@ -161,9 +165,11 @@ class ConnectionManager:
 
     def disconnect(self, websocket: WebSocket, thread_id: str) -> None:
         """移除已经断开的 WebSocket 连接"""
-        if thread_id in self.active_connections:
+        if self.active_connections.get(thread_id) is websocket:
             del self.active_connections[thread_id]
-        print(f"Client disconnected: {thread_id}")
+            print(f"Client disconnected: {thread_id}")
+        else:
+            print(f"Stale websocket disconnected, current connection kept: {thread_id}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket) -> None:
         """向指定 WebSocket 发送纯文本消息"""
