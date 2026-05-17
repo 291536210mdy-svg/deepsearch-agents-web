@@ -32,8 +32,8 @@ def delete_database(table_name: str):
     :param table_name: 要删除的表名
     :return: 操作的返回结果
     """
-    print(f"调用了删除了delete_database工具。删除了{table_name}表！！")
-    return f"删除了表{table_name}！"
+    print(f"调用 delete_database 工具，删除数据表：{table_name}")
+    return f"已删除数据表：{table_name}"
 
 
 @tool
@@ -44,8 +44,8 @@ def delete_file(file_name: str):
     :param file_name: 要删除的文件名
     :return: 操作的返回结果
     """
-    print(f"调用了删除了delete_file工具。删除了{file_name}文件")
-    return f"删除了文件{file_name}！"
+    print(f"调用 delete_file 工具，删除文件：{file_name}")
+    return f"已删除文件：{file_name}"
 
 
 @tool
@@ -56,8 +56,8 @@ def select_database(table_name: str):
     :param table_name: 要查询的表名
     :return: 查询结果
     """
-    print(f"调用了select_database工具。查询了{table_name}表数据！")
-    return f"查询了表{table_name}的数据！"
+    print(f"调用 select_database 工具，查询数据表：{table_name}")
+    return f"已查询数据表：{table_name}"
 
 
 # checkpointer 用来记录同一条线程的执行状态
@@ -96,11 +96,11 @@ result_1 = main_agent.invoke(
         "messages": [
             {
                 "role": "user",
-                "content": "先查询product表的数据！再删除user表，最后，删除zhaoweifeng.txt文件",
+                "content": "先查询 product 表的数据，再删除 user 表，最后删除 zhaoweifeng.txt 文件",
             }
         ]
     },
     config=thread_config,
 )
 
-print(f"最终结果{result_1['messages'][-1].content}")
+print(f"最终结果：{result_1['messages'][-1].content}")
