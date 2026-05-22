@@ -147,7 +147,7 @@ deepsearch-agents/
 │   │   └── server.py               # FastAPI 任务、上传、文件、下载、WebSocket 接口
 │   ├── prompt/
 │   │   └── prompts.yml             # 主智能体和子智能体提示词配置
-│   ├── rawflow/                    # RAGFlow 配置和基础调用示例
+│   ├── ragflow/                    # RAGFlow 配置和基础调用示例
 │   ├── tools/                      # Tavily、MySQL、RAGFlow、文件读取、Markdown、PDF 工具
 │   ├── utils/                      # 路径解析、Markdown/PDF 底层转换等普通 Python 工具
 │   ├── output/                     # 运行时生成：每个会话的 Markdown、PDF 等产物
