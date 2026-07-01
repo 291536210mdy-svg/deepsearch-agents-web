@@ -71,6 +71,12 @@ app.add_middleware(
 )
 
 
+@app.get("/api/health")
+async def health_check():
+    """Lightweight health check for hosted deployment platforms."""
+    return {"status": "ok"}
+
+
 class TaskRequest(BaseModel):
     """前端启动任务时提交的请求体。"""
 
