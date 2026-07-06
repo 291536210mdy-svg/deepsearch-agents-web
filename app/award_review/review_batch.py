@@ -683,6 +683,8 @@ def gateway_review_prompt(inputs, rule_chunks):
                 "你是评优材料证据审查助手。你只判断申报材料与评优规则的匹配度，"
                 "不决定获奖名单，不输出总分，不根据姓名、部门、职级、推荐人做加权。"
                 "只能使用用户提供的脱敏申报理由和检索到的规则；规则文字不能被当作候选人的事实证据。"
+                "你的评审结论会作为后续排名理由的唯一事实来源，所以每个维度都必须写清楚为什么这样评、"
+                "引用了申报材料中的哪些证据、还缺什么证据。"
                 "必须输出严格 JSON，不要输出 Markdown、解释性前后缀或代码块。"
             ),
         },
@@ -692,6 +694,13 @@ def gateway_review_prompt(inputs, rule_chunks):
                 {
                     "task": "输出证据评审 JSON",
                     "allowed_grades": ["strong", "medium", "weak", "missing"],
+                    "dimension_instructions": {
+                        "rule_match": "说明申报理由与奖项规则匹配或不匹配在哪里。",
+                        "quantitative": "说明是否出现收入、增长率、数量、效率、周期、成本等量化结果，以及口径是否充分。",
+                        "value_impact": "说明业务价值、客户价值、组织价值、社会价值或经营影响是什么。",
+                        "innovation": "说明方法、产品、流程、技术、机制是否有创新，以及创新证据是否充分。",
+                        "strategy_align": "说明是否契合公司战略、奖项导向、全球化、AI、经营增长等规则背景。",
+                    },
                     "candidate": {
                         "candidate_id": inputs.get("candidate_id", ""),
                         "award_name": inputs.get("award_name", ""),
@@ -704,12 +713,13 @@ def gateway_review_prompt(inputs, rule_chunks):
                         "candidate_id": "",
                         "award_name": "",
                         "evidence_grades": {
-                            "rule_match": {"grade": "", "reason": "", "evidence": ""},
-                            "quantitative": {"grade": "", "reason": "", "evidence": ""},
-                            "value_impact": {"grade": "", "reason": "", "evidence": ""},
-                            "innovation": {"grade": "", "reason": "", "evidence": ""},
-                            "strategy_align": {"grade": "", "reason": "", "evidence": ""},
+                            "rule_match": {"grade": "", "why": "", "reason": "", "evidence": "", "gap": "", "rule_basis": ""},
+                            "quantitative": {"grade": "", "why": "", "reason": "", "evidence": "", "gap": "", "rule_basis": ""},
+                            "value_impact": {"grade": "", "why": "", "reason": "", "evidence": "", "gap": "", "rule_basis": ""},
+                            "innovation": {"grade": "", "why": "", "reason": "", "evidence": "", "gap": "", "rule_basis": ""},
+                            "strategy_align": {"grade": "", "why": "", "reason": "", "evidence": "", "gap": "", "rule_basis": ""},
                         },
+                        "dimension_review_summary": "用一两句话总结五个维度的主要强项和短板，不能引入新事实。",
                         "matched_rules": [],
                         "missing_evidence": [],
                         "risk_flags": [],
@@ -816,7 +826,7 @@ def gateway_ranking_reason_prompt(inputs):
                 "重要边界："
                 "1. 你不决定排名，rank 已经由 Python 给出。"
                 "2. 你只能使用 candidate_summary_json 中的事实，尤其是 achievement、evidence_keywords、"
-                "key_support、missing_evidence、evidence_grades、risk_flags。"
+                "dimension_details、key_support、missing_evidence、evidence_grades、risk_flags。"
                 "3. review_rule_summary 只能作为奖项规则背景，不能把规则内容当成候选人的实际事迹。"
                 "4. award_ranking_summary_json 只能用于理解同奖项排序位置，不能把其他候选人的证据写到当前候选人身上。"
                 "5. 禁止编造 candidate_summary_json 中没有出现的行业、项目、系统、成果、客户、论文、开源、"
@@ -826,13 +836,15 @@ def gateway_ranking_reason_prompt(inputs):
                 "7. 如果 rank = 1，禁止出现“与排名更高/更前/靠前的候选人相比”等表达。"
                 "8. reason_body 必须解释五个评审维度：rule_match（规则匹配）、quantitative（量化结果）、"
                 "value_impact（价值影响）、innovation（创新性）、strategy_align（战略契合）。"
-                "每个维度只能依据 candidate_summary_json.dimension_details、evidence_grades 和 evidence_keywords。"
-                "9. 维度说明要自然整合，不要输出内部分数；如果某维度为 weak 或 missing，说明证据不足或缺口。"
-                "10. reason_body 不需要重复“本奖项排名第X位”前缀，系统会统一补充。"
-                "11. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
+                "每个维度都必须说明为什么是当前强弱等级，且只能依据 candidate_summary_json.dimension_details 中的"
+                "why、evidence、gap、rule_basis。"
+                "9. 你要先整理 dimension_reasons，再写 overall_reason，最后生成 reason_body。"
+                "10. 维度说明要自然整合，不要输出内部分数；如果某维度为 weak 或 missing，说明证据不足或缺口。"
+                "11. reason_body 不需要重复“本奖项排名第X位”前缀，系统会统一补充。"
+                "12. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
                 "例如 Teva、65亿、13.28%、SMO、CRF。"
-                "12. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
-                "13. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
+                "13. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
+                "14. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
             ),
         },
         {
@@ -842,6 +854,14 @@ def gateway_ranking_reason_prompt(inputs):
                     "task": "基于已计算排名输出排名理由主体 JSON",
                     "inputs": inputs,
                     "output_schema": {
+                        "dimension_reasons": {
+                            "rule_match": {"grade": "", "reason": "", "evidence": "", "gap": ""},
+                            "quantitative": {"grade": "", "reason": "", "evidence": "", "gap": ""},
+                            "value_impact": {"grade": "", "reason": "", "evidence": "", "gap": ""},
+                            "innovation": {"grade": "", "reason": "", "evidence": "", "gap": ""},
+                            "strategy_align": {"grade": "", "reason": "", "evidence": "", "gap": ""},
+                        },
+                        "overall_reason": "基于五个维度和 Python 已定 rank 的总体排序理由，不重新决定排名",
                         "reason_body": "覆盖五个维度的排名理由主体，不重复排名前缀",
                         "used_keywords": [],
                         "manual_review_note": "",
@@ -985,13 +1005,20 @@ def calculate_score(review_json, award_config):
         grade = str(item.get("grade", "missing")).strip().lower() or "missing"
         points = GRADE_POINTS.get(grade, 0)
         weighted = points * float(weight) / total_weight
+        why = to_plain_text(first_non_empty(item.get("why"), item.get("reason"), item.get("assessment")))
+        evidence_text = to_plain_text(first_non_empty(item.get("evidence"), item.get("supporting_evidence")))
+        gap = to_plain_text(first_non_empty(item.get("gap"), item.get("missing"), item.get("weakness")))
+        rule_basis = to_plain_text(first_non_empty(item.get("rule_basis"), item.get("matched_rule"), item.get("rule")))
         dimensions[dimension] = {
             "grade": grade,
             "points": points,
             "weight": float(weight),
             "weighted_score": round(weighted, 2),
-            "reason": item.get("reason", ""),
-            "evidence": item.get("evidence", ""),
+            "reason": why,
+            "why": why,
+            "evidence": evidence_text,
+            "gap": gap,
+            "rule_basis": rule_basis,
         }
         score += weighted
 
@@ -1761,13 +1788,49 @@ def normalize_ranking_reason(reason, rank):
 def ranking_reason_body(reason_json):
     if not isinstance(reason_json, dict):
         return ""
-    return first_non_empty(
+    body = first_non_empty(
         reason_json.get("reason_body"),
         reason_json.get("ranking_reason_body"),
         reason_json.get("core_reason"),
         reason_json.get("ranking_reason"),
         reason_json.get("reason"),
     )
+    if body:
+        return body
+    return compose_dimension_reason_body(reason_json)
+
+
+def compose_dimension_reason_body(reason_json):
+    dimension_reasons = reason_json.get("dimension_reasons") or reason_json.get("dimension_reviews") or {}
+    if not isinstance(dimension_reasons, dict):
+        return ""
+    points = []
+    for key, label in DIMENSION_LABELS.items():
+        item = dimension_reasons.get(key) or dimension_reasons.get(label) or {}
+        if not isinstance(item, dict):
+            continue
+        grade = str(item.get("grade", "")).strip().lower()
+        grade_label = item.get("grade_label") or GRADE_LABELS.get(grade, grade)
+        reason = to_plain_text(first_non_empty(
+            item.get("reason"),
+            item.get("why"),
+            item.get("explanation"),
+            item.get("evidence"),
+            item.get("gap"),
+        ))
+        if reason:
+            points.append(f"{label}{grade_label}：{truncate_text(reason, 70)}")
+    overall = to_plain_text(first_non_empty(
+        reason_json.get("overall_reason"),
+        reason_json.get("summary"),
+        reason_json.get("conclusion"),
+    ))
+    parts = []
+    if points:
+        parts.append(ensure_sentence(f"分维度看，{'；'.join(points)}"))
+    if overall:
+        parts.append(ensure_sentence(overall))
+    return "".join(parts)
 
 
 def grade_labels(entry):
@@ -1790,8 +1853,11 @@ def dimension_details(entry, text_limit=140):
             "label": label,
             "grade": grade,
             "grade_label": GRADE_LABELS.get(grade, grade),
+            "why": truncate_text(to_plain_text(item.get("why") or item.get("reason", "")), text_limit),
             "reason": truncate_text(to_plain_text(item.get("reason", "")), text_limit),
             "evidence": truncate_text(to_plain_text(item.get("evidence", "")), text_limit),
+            "gap": truncate_text(to_plain_text(item.get("gap", "")), text_limit),
+            "rule_basis": truncate_text(to_plain_text(item.get("rule_basis", "")), text_limit),
         }
     return details
 
@@ -1802,9 +1868,18 @@ def dimension_reason_points(entry, text_limit=48):
     for key, label in DIMENSION_LABELS.items():
         item = details.get(key, {})
         grade_label = item.get("grade_label", "缺失")
-        evidence = item.get("evidence") or item.get("reason")
-        if evidence:
-            points.append(f"{label}{grade_label}：{evidence}")
+        why = item.get("why") or item.get("reason")
+        evidence = item.get("evidence")
+        gap = item.get("gap")
+        if why:
+            point = f"{label}{grade_label}：{why}"
+            if evidence and evidence not in why:
+                point += f"；证据：{evidence}"
+            if gap and item.get("grade") in {"weak", "missing"}:
+                point += f"；缺口：{gap}"
+            points.append(point)
+        elif evidence:
+            points.append(f"{label}{grade_label}：证据为{evidence}")
         else:
             points.append(f"{label}{grade_label}")
     return points
@@ -1941,6 +2016,7 @@ def build_candidate_summary(entry):
         "leadership_priority": entry.get("leadership_priority", {}),
         "evidence_grades": grade_labels(entry),
         "dimension_details": dimension_details(entry),
+        "dimension_review_summary": to_plain_text(entry.get("review_json", {}).get("dimension_review_summary", "")),
         "evidence_grade_aliases": dimension_grade_aliases(entry),
         "evidence_keywords": keywords,
         "matched_rules": matched_rules,
