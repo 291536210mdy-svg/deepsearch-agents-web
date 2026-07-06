@@ -13,8 +13,9 @@ from langchain.chat_models import init_chat_model
 # find_dotenv 会从当前目录向上查找 .env，适合脚本和 Web 服务从不同入口启动的场景
 load_dotenv(find_dotenv())
 
-# 使用 OpenAI 兼容协议接入模型；具体模型名由 .env 中的 LLM_QWEN_MAX 控制
+# 使用 OpenAI 兼容协议接入模型；优先读取通用的 LLM_MODEL，兼容旧的 LLM_QWEN_MAX 配置
+llm_name = os.getenv("LLM_MODEL") or os.getenv("LLM_QWEN_MAX")
 model = init_chat_model(
-    model=os.getenv("LLM_QWEN_MAX"),
+    model=llm_name,
     model_provider="openai",
 )

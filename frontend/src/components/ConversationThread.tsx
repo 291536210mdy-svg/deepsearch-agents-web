@@ -322,7 +322,7 @@ function AssistantMessage({
       <div className="message-avatar">AI</div>
       <div className="message-bubble">
         <div className="message-meta">
-          <span>DeepSearch Agents</span>
+          <span>TMOD Agents</span>
           <time>{syncLabel}</time>
         </div>
 
@@ -333,7 +333,7 @@ function AssistantMessage({
           <summary>
             <span>
               <BranchesOutlined aria-hidden />
-              深度研搜过程
+              深度思考过程
             </span>
             <strong>{events.length}</strong>
           </summary>
@@ -381,10 +381,10 @@ export function ConversationThread({
       <div className="conversation-empty">
         <div className="empty-examples">
           <div className="empty-examples-copy">
-            <span className="panel-kicker">TASK EXAMPLES</span>
-            <h3>选择一个工具任务开始</h3>
+            <span className="panel-kicker">WORK SCENARIOS</span>
+            <h3>Hi，今天想让我帮你处理什么 HR 任务？</h3>
             <p>
-              每个示例会触发不同工具路径，执行轨迹和输出文件会直接出现在对话里。
+              点击每个示例，我会把你执行不同的hr业务噢
             </p>
           </div>
 

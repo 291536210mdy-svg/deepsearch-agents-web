@@ -1,7 +1,6 @@
 import {
   ApiOutlined,
   BranchesOutlined,
-  CheckCircleOutlined,
   CloseCircleOutlined,
   CloudServerOutlined,
   DatabaseOutlined,
@@ -13,7 +12,6 @@ import { useEffect, useRef, useState } from "react";
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationThread } from "./components/ConversationThread";
 import type { ChatTurn } from "./components/ConversationThread";
-import { API_BASE_URL, WS_BASE_URL } from "./lib/config";
 import { useDeepAgentSession } from "./hooks/useDeepAgentSession";
 import type { ConnectionState, UploadedItem } from "./types";
 
@@ -142,21 +140,13 @@ export default function App() {
     <div className="chat-app-shell min-h-dvh">
       <aside className="chat-sidebar" aria-label="会话信息">
         <div className="sidebar-brand">
-          <span className="panel-kicker">DEEPSEARCH</span>
-          <h1>深度研搜</h1>
-          <p>对话式多智能体研究台</p>
+          <h1>复星医药</h1>
+          <p>TMOD智能员工</p>
         </div>
 
         <Button className="new-chat-button" block onClick={handleNewSession}>
-          新建研搜
+          新建对话
         </Button>
-
-        <div className="sidebar-section">
-          <span className="sidebar-label">THREAD</span>
-          <strong className="thread-id" title={session.threadId}>
-            {session.threadId.slice(0, 8)}
-          </strong>
-        </div>
 
         <div className="sidebar-status-list">
           <div className={`sidebar-status ${online ? "sidebar-status--online" : "sidebar-status--warn"}`}>
@@ -199,23 +189,20 @@ export default function App() {
           </ul>
         </div>
 
-        <div className="sidebar-section sidebar-endpoints">
-          <span className="sidebar-label">ENDPOINTS</span>
-          <code>{API_BASE_URL}</code>
-          <code>{WS_BASE_URL}</code>
-        </div>
       </aside>
 
       <main className="chat-main">
         <header className="chat-topbar">
           <div>
-            <span className="panel-kicker">CHAT WORKSPACE</span>
-            <h2>深度研搜对话</h2>
+            <span className="panel-kicker">AI WORKSPACE</span>
+            <h2>TMOD 智能工作台</h2>
           </div>
-          <div className={`run-indicator ${session.isRunning ? "run-indicator--live" : ""}`}>
-            {session.isRunning ? <BranchesOutlined aria-hidden /> : <CheckCircleOutlined aria-hidden />}
-            {session.isRunning ? "研搜中" : "待命"}
-          </div>
+          {session.isRunning ? (
+            <div className="run-indicator run-indicator--live">
+              <BranchesOutlined aria-hidden />
+              研搜中
+            </div>
+          ) : null}
         </header>
 
         {session.lastError ? (
