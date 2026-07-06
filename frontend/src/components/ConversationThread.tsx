@@ -12,6 +12,7 @@ import {
   FileTextOutlined,
   StopOutlined,
   ToolOutlined,
+  TrophyOutlined,
 } from "@ant-design/icons";
 import { Button, Tooltip } from "antd";
 import { useEffect, useRef, useState } from "react";
@@ -55,6 +56,13 @@ const TASK_EXAMPLES = [
     prompt:
       "请使用 RAGFlow 助手，查询公司内部白皮书中关于品类策略的内容，并整理成三条可执行建议。",
     icon: <FileSearchOutlined aria-hidden />,
+  },
+  {
+    tool: "AI评优助手",
+    title: "评优候选排序",
+    prompt:
+      "请对我上传的评优提名 Excel 跑评优，生成候选排序、评审结果和排名理由。",
+    icon: <TrophyOutlined aria-hidden />,
   },
   {
     tool: "文件读取工具",

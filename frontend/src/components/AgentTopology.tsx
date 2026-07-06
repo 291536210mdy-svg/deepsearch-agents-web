@@ -1,4 +1,4 @@
-import { CloudServerOutlined, DatabaseOutlined, FileSearchOutlined } from "@ant-design/icons";
+import { CloudServerOutlined, DatabaseOutlined, FileSearchOutlined, TrophyOutlined } from "@ant-design/icons";
 
 const agents = [
   {
@@ -15,6 +15,11 @@ const agents = [
     icon: <FileSearchOutlined aria-hidden />,
     name: "RAGFlow 助手",
     detail: "内部 PDF、白皮书、研报与私有知识库问答"
+  },
+  {
+    icon: <TrophyOutlined aria-hidden />,
+    name: "AI评优助手",
+    detail: "评优提名 Excel、候选排序、评审结果与排名理由"
   }
 ];
 
@@ -33,6 +38,7 @@ export function AgentTopology() {
           <strong>调度主智能体</strong>
         </div>
         <div className="agent-links" aria-hidden>
+          <span />
           <span />
           <span />
           <span />

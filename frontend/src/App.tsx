@@ -5,7 +5,8 @@ import {
   CloudServerOutlined,
   DatabaseOutlined,
   FileSearchOutlined,
-  ToolOutlined
+  ToolOutlined,
+  TrophyOutlined
 } from "@ant-design/icons";
 import { Alert, App as AntApp, Button } from "antd";
 import { useEffect, useRef, useState } from "react";
@@ -185,6 +186,10 @@ export default function App() {
             <li>
               <FileSearchOutlined aria-hidden />
               RAGFlow 助手
+            </li>
+            <li>
+              <TrophyOutlined aria-hidden />
+              AI评优助手
             </li>
           </ul>
         </div>
