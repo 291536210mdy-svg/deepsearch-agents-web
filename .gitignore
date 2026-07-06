@@ -24,6 +24,7 @@ frontend/.vite/
 venv/
 env/
 .env
+.env.bak.*
 __pycache__/
 *.py[cod]
 *$py.class

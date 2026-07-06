@@ -806,22 +806,34 @@ def gateway_ranking_reason_prompt(inputs):
         {
             "role": "system",
             "content": (
-                "你是评优排名理由撰写助手。你必须基于同奖项候选对比、证据强弱、缺失证据和风险提示生成理由。"
-                "不要输出内部分数，不要虚构事实，不要写团队/个人申报类型待确认句。"
-                "必须输出严格 JSON，不要输出 Markdown、解释性前后缀或代码块。"
+                "你是评优排名理由写作助手。你的任务是基于 Python 已经计算出的排名结果，写“排名理由主体”。"
+                "重要边界："
+                "1. 你不决定排名，rank 已经由 Python 给出。"
+                "2. 你只能使用 candidate_summary_json 中的事实，尤其是 achievement、evidence_keywords、"
+                "key_support、missing_evidence、evidence_grades、risk_flags。"
+                "3. review_rule_summary 只能作为奖项规则背景，不能把规则内容当成候选人的实际事迹。"
+                "4. award_ranking_summary_json 只能用于理解同奖项排序位置，不能把其他候选人的证据写到当前候选人身上。"
+                "5. 禁止编造 candidate_summary_json 中没有出现的行业、项目、系统、成果、客户、论文、开源、"
+                "社区治理、基层调解、核心算法、核心模块、系统架构升级等内容。"
+                "6. 如果 achievement 显示“详见附件”“待补充”“正文证据不足”，或者 evidence_grades 大多为 missing，"
+                "不要写正向夸奖，必须写成证据不足、需人工结合附件复核。"
+                "7. 如果 rank = 1，禁止出现“与排名更高/更前/靠前的候选人相比”等表达。"
+                "8. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
+                "例如 Teva、65亿、13.28%、SMO、CRF。"
+                "9. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
+                "10. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
-                    "task": "输出排名理由 JSON",
+                    "task": "基于已计算排名输出排名理由主体 JSON",
                     "inputs": inputs,
                     "output_schema": {
-                        "ranking_reason": "不超过120字，解释该候选为什么排在当前名次",
-                        "key_support": ["最多3条主要支撑"],
-                        "key_gap": ["最多2条主要不足"],
-                        "manual_review_note": "如需人工复核则写原因，否则为空字符串",
+                        "reason_body": "",
+                        "used_keywords": [],
+                        "manual_review_note": "",
                     },
                 },
                 ensure_ascii=False,
