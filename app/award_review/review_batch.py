@@ -127,6 +127,12 @@ GRADE_POINTS = {
     "weak": 35,
     "missing": 0,
 }
+GRADE_LABELS = {
+    "strong": "强",
+    "medium": "中",
+    "weak": "弱",
+    "missing": "缺失",
+}
 DEFAULT_AWARD_CONFIG_DATA = {
     "default": {
         "quota": 2,
@@ -818,10 +824,15 @@ def gateway_ranking_reason_prompt(inputs):
                 "6. 如果 achievement 显示“详见附件”“待补充”“正文证据不足”，或者 evidence_grades 大多为 missing，"
                 "不要写正向夸奖，必须写成证据不足、需人工结合附件复核。"
                 "7. 如果 rank = 1，禁止出现“与排名更高/更前/靠前的候选人相比”等表达。"
-                "8. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
+                "8. reason_body 必须解释五个评审维度：rule_match（规则匹配）、quantitative（量化结果）、"
+                "value_impact（价值影响）、innovation（创新性）、strategy_align（战略契合）。"
+                "每个维度只能依据 candidate_summary_json.dimension_details、evidence_grades 和 evidence_keywords。"
+                "9. 维度说明要自然整合，不要输出内部分数；如果某维度为 weak 或 missing，说明证据不足或缺口。"
+                "10. reason_body 不需要重复“本奖项排名第X位”前缀，系统会统一补充。"
+                "11. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
                 "例如 Teva、65亿、13.28%、SMO、CRF。"
-                "9. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
-                "10. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
+                "12. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
+                "13. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
             ),
         },
         {
@@ -831,7 +842,7 @@ def gateway_ranking_reason_prompt(inputs):
                     "task": "基于已计算排名输出排名理由主体 JSON",
                     "inputs": inputs,
                     "output_schema": {
-                        "reason_body": "",
+                        "reason_body": "覆盖五个维度的排名理由主体，不重复排名前缀",
                         "used_keywords": [],
                         "manual_review_note": "",
                     },
@@ -1580,7 +1591,10 @@ def build_ranking_reason(entry):
     parts = [
         f"本奖项排名第{entry.get('award_rank', '')}位。{score_sentence}"
     ]
-    if strong_or_medium:
+    dimension_points = dimension_reason_points(entry, text_limit=36)
+    if dimension_points:
+        parts.append(ensure_sentence(f"分维度看，{'；'.join(dimension_points)}"))
+    elif strong_or_medium:
         parts.append(f"主要支撑来自{('、').join(strong_or_medium[:3])}。")
     elif not points:
         parts.append("申报材料暂未形成足够的可评分证据。")
@@ -1601,7 +1615,7 @@ def build_ranking_reason(entry):
         parts.append(ensure_sentence(f"需补充/复核：{missing_text}"))
     if entry.get("recommendation_status") == "needs_review":
         parts.append("因此需人工复核后再确认最终意见。")
-    return truncate_text("".join(parts), 320)
+    return truncate_text("".join(parts), 480)
 
 
 def truncate_text(value, limit=260):
@@ -1740,8 +1754,8 @@ def normalize_ranking_reason(reason, rank):
     text = re.sub(r"位居当前名次[，。；;]?", "", text).strip()
     prefix = f"本奖项排名第{rank}位。"
     if text.startswith(prefix):
-        return truncate_text(text, 260)
-    return truncate_text(prefix + text, 260)
+        return truncate_text(text, 480)
+    return truncate_text(prefix + text, 480)
 
 
 def ranking_reason_body(reason_json):
@@ -1762,6 +1776,38 @@ def grade_labels(entry):
         label: (dimensions.get(key, {}) or {}).get("grade", "missing")
         for key, label in DIMENSION_LABELS.items()
     }
+
+
+def dimension_details(entry, text_limit=140):
+    dimensions = entry.get("score_detail", {}).get("dimensions", {})
+    if not dimensions:
+        return {}
+    details = {}
+    for key, label in DIMENSION_LABELS.items():
+        item = dimensions.get(key, {}) or {}
+        grade = str(item.get("grade", "missing")).strip().lower() or "missing"
+        details[key] = {
+            "label": label,
+            "grade": grade,
+            "grade_label": GRADE_LABELS.get(grade, grade),
+            "reason": truncate_text(to_plain_text(item.get("reason", "")), text_limit),
+            "evidence": truncate_text(to_plain_text(item.get("evidence", "")), text_limit),
+        }
+    return details
+
+
+def dimension_reason_points(entry, text_limit=48):
+    details = dimension_details(entry, text_limit)
+    points = []
+    for key, label in DIMENSION_LABELS.items():
+        item = details.get(key, {})
+        grade_label = item.get("grade_label", "缺失")
+        evidence = item.get("evidence") or item.get("reason")
+        if evidence:
+            points.append(f"{label}{grade_label}：{evidence}")
+        else:
+            points.append(f"{label}{grade_label}")
+    return points
 
 
 def key_strengths(entry, limit=3):
@@ -1894,6 +1940,7 @@ def build_candidate_summary(entry):
         "normal_review_score": entry.get("normal_review_score", internal_score),
         "leadership_priority": entry.get("leadership_priority", {}),
         "evidence_grades": grade_labels(entry),
+        "dimension_details": dimension_details(entry),
         "evidence_grade_aliases": dimension_grade_aliases(entry),
         "evidence_keywords": keywords,
         "matched_rules": matched_rules,
@@ -1966,7 +2013,7 @@ def add_leadership_priority_context(reason, entry):
     note = priority.get("priority_note") or f"结合{priority.get('source_label', '内部')}战略优先级。"
     if not text or note in text:
         return text
-    return truncate_text(text + note, 360)
+    return truncate_text(text + note, 520)
 
 
 def is_low_quality_ranking_reason(reason_body, entry):
