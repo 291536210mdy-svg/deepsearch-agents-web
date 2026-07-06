@@ -127,6 +127,13 @@ GRADE_POINTS = {
     "weak": 35,
     "missing": 0,
 }
+REVIEW_DIMENSION_KEYS = (
+    "rule_match",
+    "quantitative",
+    "value_impact",
+    "innovation",
+    "strategy_align",
+)
 GRADE_LABELS = {
     "strong": "强",
     "medium": "中",
@@ -444,6 +451,18 @@ def auth_header_value(api_key):
     return f"Bearer {token}"
 
 
+def openai_endpoint_url(base_url, endpoint):
+    base = str(base_url or "").strip().rstrip("/")
+    endpoint = str(endpoint or "").strip("/")
+    if not base or not endpoint:
+        return base
+    if base.endswith(f"/v1/{endpoint}") or base.endswith(f"/{endpoint}"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/{endpoint}"
+    return f"{base}/v1/{endpoint}"
+
+
 def call_json_post(url, api_key, payload, timeout):
     response = requests.post(
         url,
@@ -459,15 +478,20 @@ def call_json_post(url, api_key, payload, timeout):
     except requests.HTTPError as exc:
         error_detail = response_text_for_error(response)
         raise RuntimeError(f"AI gateway HTTP {response.status_code}: {error_detail}") from exc
-    return response.json()
+    body = response.json()
+    if isinstance(body, dict) and body.get("code") not in (None, 0, "0") and not any(
+        key in body for key in ("choices", "data", "embeddings", "results")
+    ):
+        raise RuntimeError(f"AI gateway error {body.get('code')}: {body.get('message') or body}")
+    return body
 
 
 def chat_content_from_response(body):
     choices = body.get("choices") or []
     if not choices:
-        return ""
+        return str(body.get("content") or "")
     message = choices[0].get("message", {})
-    content = message.get("content", "")
+    content = message.get("content") or message.get("reasoning_content") or body.get("content", "")
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -479,14 +503,24 @@ def chat_content_from_response(body):
     return str(content or "")
 
 
-def call_gateway_chat(config, messages, timeout, *, max_tokens=4000):
+def call_gateway_chat(config, messages, timeout, *, max_tokens=4000, json_mode=False):
     payload = {
         "model": config.gateway_chat_model,
         "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
     }
-    body = call_json_post(config.gateway_chat_url, config.gateway_chat_api_key, payload, timeout)
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        body = call_json_post(openai_endpoint_url(config.gateway_chat_url, "chat/completions"), config.gateway_chat_api_key, payload, timeout)
+    except RuntimeError as exc:
+        if not json_mode or not re.search(r"response_format|json_object", str(exc), flags=re.I):
+            raise
+        payload.pop("response_format", None)
+        body = call_json_post(openai_endpoint_url(config.gateway_chat_url, "chat/completions"), config.gateway_chat_api_key, payload, timeout)
+        if isinstance(body, dict):
+            body["_json_mode_fallback"] = True
     return body, chat_content_from_response(body)
 
 
@@ -518,7 +552,7 @@ def call_gateway_embeddings(config, texts, timeout):
         "model": config.gateway_embedding_model,
         "input": texts,
     }
-    body = call_json_post(config.gateway_embedding_url, config.gateway_embedding_api_key, payload, timeout)
+    body = call_json_post(openai_endpoint_url(config.gateway_embedding_url, "embeddings"), config.gateway_embedding_api_key, payload, timeout)
     return embeddings_from_response(body)
 
 
@@ -786,19 +820,36 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
         ]
     )
     rule_chunks = rule_retriever.retrieve(query) if rule_retriever else []
-    review_body, review_text = call_gateway_chat(config, gateway_review_prompt(inputs, rule_chunks), timeout)
-    final_body, final_text = call_gateway_chat(config, gateway_final_fields_prompt(inputs), timeout)
-    review_json = parse_json_maybe(review_text)
+    review_body, review_text, review_json, review_attempts, review_errors = call_gateway_review_json(
+        config,
+        gateway_review_prompt(inputs, rule_chunks),
+        timeout,
+    )
+    final_body, final_text = call_gateway_chat(
+        config,
+        gateway_final_fields_prompt(inputs),
+        timeout,
+        json_mode=True,
+    )
     final_fields_json = parse_json_maybe(final_text)
+    status = "failed" if review_errors else "succeeded"
+    review_validation_error = "; ".join(review_errors)
     outputs = {
         "review_result_json": review_json,
         "final_fields_json": final_fields_json,
         "retrieved_rules": rule_chunks,
+        "raw_review_text": review_text,
+        "raw_final_fields_text": final_text,
+        "review_attempts": review_attempts,
+        "review_retry_count": max(0, len(review_attempts) - 1),
+        "review_schema_valid": not review_errors,
+        "review_validation_error": review_validation_error,
     }
     body = {
         "data": {
-            "status": "succeeded",
+            "status": status,
             "backend": "gateway",
+            "error": review_validation_error,
             "outputs": outputs,
         },
         "gateway_responses": {
@@ -806,6 +857,7 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
                 "id": review_body.get("id", ""),
                 "model": review_body.get("model", config.gateway_chat_model),
                 "usage": review_body.get("usage", {}),
+                "attempts": review_attempts,
             },
             "final_fields": {
                 "id": final_body.get("id", ""),
@@ -874,7 +926,13 @@ def gateway_ranking_reason_prompt(inputs):
 
 
 def call_gateway_ranking_reason(config, inputs, timeout):
-    _body, text = call_gateway_chat(config, gateway_ranking_reason_prompt(inputs), timeout, max_tokens=1200)
+    _body, text = call_gateway_chat(
+        config,
+        gateway_ranking_reason_prompt(inputs),
+        timeout,
+        max_tokens=2500,
+        json_mode=True,
+    )
     return parse_json_maybe(text)
 
 
@@ -932,6 +990,93 @@ def parse_json_maybe(text):
                     return parsed
             return parsed_candidates[0]
     return {}
+
+
+def validate_review_json(review_json):
+    errors = []
+    if not isinstance(review_json, dict) or not review_json:
+        return ["review_result_json is empty or not a JSON object"]
+    evidence = review_json.get("evidence_grades")
+    if not isinstance(evidence, dict):
+        return ["missing evidence_grades object"]
+
+    allowed_grades = set(GRADE_POINTS)
+    for dimension in REVIEW_DIMENSION_KEYS:
+        item = evidence.get(dimension)
+        if not isinstance(item, dict):
+            errors.append(f"missing evidence_grades.{dimension}")
+            continue
+        grade = str(item.get("grade", "")).strip().lower()
+        if grade not in allowed_grades:
+            errors.append(f"invalid evidence_grades.{dimension}.grade: {grade or '<empty>'}")
+            continue
+        item["grade"] = grade
+        why = first_non_empty(
+            item.get("why"),
+            item.get("reason"),
+            item.get("assessment"),
+            item.get("evidence"),
+            item.get("gap"),
+            item.get("rule_basis"),
+        )
+        if not str(why or "").strip():
+            errors.append(f"missing explanation for evidence_grades.{dimension}")
+    return errors
+
+
+def review_retry_message(errors, raw_text):
+    return {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "task": "修正上一轮输出，重新返回严格 JSON",
+                "problems": errors,
+                "previous_output_preview": truncate_text(raw_text, 3000),
+                "requirements": [
+                    "只返回 JSON 对象，不要 Markdown，不要代码块，不要解释性文字。",
+                    "必须包含 evidence_grades，且包含 rule_match、quantitative、value_impact、innovation、strategy_align 五个维度。",
+                    "每个维度必须包含 grade，并且 grade 只能是 strong、medium、weak、missing。",
+                    "每个维度必须写清 why/reason/evidence/gap/rule_basis 中至少一个可审计依据。",
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def call_gateway_review_json(config, messages, timeout, *, max_attempts=2):
+    attempts = []
+    current_messages = list(messages)
+    last_body = {}
+    last_text = ""
+    last_json = {}
+    last_errors = []
+
+    for attempt_index in range(1, max_attempts + 1):
+        body, text = call_gateway_chat(config, current_messages, timeout, json_mode=True)
+        parsed = parse_json_maybe(text)
+        errors = validate_review_json(parsed)
+        attempts.append(
+            {
+                "attempt": attempt_index,
+                "schema_valid": not errors,
+                "errors": errors,
+                "raw_text_preview": truncate_text(text, 1200),
+                "response_id": body.get("id", ""),
+                "model": body.get("model", config.gateway_chat_model),
+                "usage": body.get("usage", {}),
+            }
+        )
+        last_body = body
+        last_text = text
+        last_json = parsed
+        last_errors = errors
+        if not errors:
+            return body, text, parsed, attempts, []
+        if attempt_index < max_attempts:
+            current_messages = list(messages) + [review_retry_message(errors, text)]
+
+    return last_body, last_text, last_json, attempts, last_errors
 
 
 def first_non_empty(*values, default=""):
@@ -2204,6 +2349,10 @@ def build_detail_row(entry):
         "tie_break_score": entry["tie_break_score"],
         "completion_fields": json.dumps(entry["completion_fields"], ensure_ascii=False),
         "error": entry["error"],
+        "review_schema_valid": entry["outputs"].get("review_schema_valid", ""),
+        "review_validation_error": entry["outputs"].get("review_validation_error", ""),
+        "review_retry_count": entry["outputs"].get("review_retry_count", ""),
+        "raw_review_text": truncate_text(entry["outputs"].get("raw_review_text", ""), 10000),
         "missing_evidence": json.dumps(entry["review_json"].get("missing_evidence", []), ensure_ascii=False),
         "risk_flags": json.dumps(entry["review_json"].get("risk_flags", []), ensure_ascii=False),
         "explanation": entry["review_json"].get("explanation", ""),
@@ -2387,6 +2536,10 @@ def write_results_xlsx(template_path, output_path, result_rows, detail_rows):
         "tie_break_score",
         "completion_fields",
         "error",
+        "review_schema_valid",
+        "review_validation_error",
+        "review_retry_count",
+        "raw_review_text",
         "missing_evidence",
         "risk_flags",
         "explanation",
@@ -2420,6 +2573,13 @@ def write_internal_pack(path, entries):
                 "award_type": entry["award_type"],
                 "workflow_status": entry.get("workflow_status", ""),
                 "workflow_error": entry.get("error", ""),
+                "review_diagnostics": {
+                    "schema_valid": entry.get("outputs", {}).get("review_schema_valid", ""),
+                    "validation_error": entry.get("outputs", {}).get("review_validation_error", ""),
+                    "retry_count": entry.get("outputs", {}).get("review_retry_count", ""),
+                    "attempts": entry.get("outputs", {}).get("review_attempts", []),
+                    "raw_review_text": entry.get("outputs", {}).get("raw_review_text", ""),
+                },
                 "recommendation": {
                     "status": entry["recommendation_status"],
                     "rank": entry["award_rank"],
@@ -2806,6 +2966,14 @@ def run_review_batch(config, event_sink=None, should_cancel=None):
                     workflow_status = response_body.get("data", {}).get("status", "succeeded")
                     review_json = parse_json_maybe(outputs.get("review_result_json"))
                     final_fields_json = parse_json_maybe(outputs.get("final_fields_json"))
+                    review_errors = validate_review_json(review_json)
+                    if review_errors:
+                        workflow_status = "failed"
+                        error = response_body.get("data", {}).get("error", "") or "; ".join(review_errors)
+                        outputs.setdefault("review_schema_valid", False)
+                        outputs.setdefault("review_validation_error", error)
+                    else:
+                        error = response_body.get("data", {}).get("error", "")
             except Exception as exc:
                 workflow_status = "failed"
                 error = str(exc)
