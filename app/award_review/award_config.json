@@ -1,0 +1,16 @@
+{
+  "default": {
+    "quota": 2,
+    "weights": {
+      "rule_match": 0.25,
+      "quantitative": 0.2,
+      "value_impact": 0.25,
+      "innovation": 0.15,
+      "strategy_align": 0.15
+    },
+    "risk_penalty_per_flag": 5,
+    "max_risk_penalty": 15,
+    "tie_break_keywords": ["一线", "海外"]
+  },
+  "awards": {}
+}

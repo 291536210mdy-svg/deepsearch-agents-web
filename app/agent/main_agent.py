@@ -1,7 +1,7 @@
 """
 主智能体组装与异步执行模块
 
-负责把模型、主提示词、文件类工具和三个专家子智能体组装成 DeepAgent，
+负责把模型、主提示词、文件类工具和四个专家子智能体组装成 DeepAgent，
 并提供 run_deep_agent 作为后续 API 层调用的统一入口。运行时还会为每个
 session_id 创建独立工作目录，并把工具调用、子智能体调用和最终结果推送给前端。
 """
@@ -15,6 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
+from app.agent.subagents.award_review_agent import award_review_agent
 from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
 from app.agent.subagents.network_search_agent import network_search_agent
@@ -32,14 +33,19 @@ from app.tools.upload_file_read_tool import read_file_content
 
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
-# 2. subagents 放网络、数据库、RAGFlow 三类信息获取助手
+# 2. subagents 放评优、网络、数据库、RAGFlow 四类专家助手
 # 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
 main_agent = create_deep_agent(
     model=model,
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf, read_file_content],
     checkpointer=InMemorySaver(),
-    subagents=[database_query_agent, network_search_agent, knowledge_base_agent],
+    subagents=[
+        database_query_agent,
+        network_search_agent,
+        knowledge_base_agent,
+        award_review_agent,
+    ],
 )
 
 # 当前文件位于 app/agent/main_agent.py，parents[1] 即 app 目录
