@@ -25,6 +25,7 @@ AWARD_REVIEW_DIR = APP_ROOT / "award_review"
 DEFAULT_TEMPLATE_PATH = AWARD_REVIEW_DIR / "评选结果输出格式.xlsx"
 DEFAULT_AWARD_CONFIG_PATH = AWARD_REVIEW_DIR / "award_config.json"
 DEFAULT_RULES_PATH = AWARD_REVIEW_DIR / "2025年度评优规则_知识库版.md"
+DEFAULT_PREFLIGHT_TIMEOUT = 20
 
 
 def _resolve_session_file(filename: str) -> Path:
@@ -129,6 +130,32 @@ class AwardReviewEventSink:
         )
 
 
+def _gateway_preflight(config: rb.ReviewBatchConfig) -> None:
+    if (config.model_backend or "gateway").strip().lower() != "gateway" or config.dry_run:
+        return
+
+    timeout = int(os.getenv("AWARD_REVIEW_PREFLIGHT_TIMEOUT", str(DEFAULT_PREFLIGHT_TIMEOUT)))
+    messages = [
+        {
+            "role": "user",
+            "content": '请只返回 {"ok": true}，不要输出其他内容。',
+        }
+    ]
+    try:
+        rb.call_gateway_chat(
+            config,
+            messages,
+            min(timeout, config.timeout),
+            max_tokens=32,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "AI Gateway 预检失败：线上后端无法在 "
+            f"{timeout} 秒内调用评优 chat 模型。请检查 Railway 是否能访问集团 AI 网关、"
+            f"密钥和模型名。原始错误：{exc}"
+        ) from exc
+
+
 @tool
 def run_award_review(
     filename: Annotated[str, "当前会话目录中的评优 Excel 文件名，必须是 .xlsx"],
@@ -182,6 +209,18 @@ def run_award_review(
             gateway_rerank_url=os.getenv("AI_GATEWAY_RERANK_URL", ""),
             gateway_rerank_api_key=os.getenv("AI_GATEWAY_RERANK_API_KEY", ""),
             gateway_rerank_model=os.getenv("AI_GATEWAY_RERANK_MODEL", "bge-reranker-v2-m3"),
+        )
+
+        monitor._emit(
+            "tool_progress",
+            "正在预检 AI Gateway 连通性",
+            {"tool_name": "AI评优批处理工具", "event_type": "gateway:preflight"},
+        )
+        _gateway_preflight(config)
+        monitor._emit(
+            "tool_progress",
+            "AI Gateway 预检通过",
+            {"tool_name": "AI评优批处理工具", "event_type": "gateway:preflight_done"},
         )
 
         result = rb.run_review_batch(config, event_sink=AwardReviewEventSink())

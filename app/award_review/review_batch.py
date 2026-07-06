@@ -2709,7 +2709,19 @@ def run_review_batch(config, event_sink=None, should_cancel=None):
                 "recommended_quota": int(current_award_config.get("quota", config.top_n) or config.top_n),
             }
             candidate_entries.append(entry)
-            jsonl.write(json.dumps({"inputs": inputs, "outputs": outputs, "response": response_body}, ensure_ascii=False) + "\n")
+            jsonl.write(
+                json.dumps(
+                    {
+                        "inputs": inputs,
+                        "outputs": outputs,
+                        "response": response_body,
+                        "workflow_status": workflow_status,
+                        "error": error,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
             jsonl.flush()
             print(f"[{idx}/{len(records)}] {inputs['candidate_id']} {inputs['award_name']} -> {workflow_status}", flush=True)
             if workflow_status in {"succeeded", "dry_run"}:
@@ -2720,9 +2732,10 @@ def run_review_batch(config, event_sink=None, should_cancel=None):
                     payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status},
                 )
             else:
+                error_preview = truncate_text(error, 240) if error else "未返回错误详情"
                 sink.emit(
                     "candidate:failed",
-                    message=f"第 {idx}/{len(records)} 行失败",
+                    message=f"第 {idx}/{len(records)} 行失败：{error_preview}",
                     level="warn",
                     progress=(idx, len(records)),
                     payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status, "error": error},
