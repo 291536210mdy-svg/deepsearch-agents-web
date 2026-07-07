@@ -706,6 +706,30 @@ def call_gateway_rerank(config, query, documents, timeout, top_n):
     return rerank_results_from_response(body)
 
 
+def award_rule_title(title):
+    return re.sub(r"^\s*\d+\s*[.．、]\s*", "", str(title or "")).strip()
+
+
+def award_rule_match_key(value):
+    return "".join(re.findall(r"[0-9a-z\u4e00-\u9fff]+", str(value or "").lower()))
+
+
+def award_rule_match_keys(value):
+    text = award_rule_title(value)
+    candidates = {text}
+    without_parenthetical_english = re.sub(
+        r"\s*[\(（][A-Za-z0-9][A-Za-z0-9\s.,&'’/\-]*[\)）]\s*",
+        "",
+        text,
+    ).strip()
+    if without_parenthetical_english:
+        candidates.add(without_parenthetical_english)
+    without_english_suffix = re.sub(r"\s+[A-Za-z][A-Za-z0-9\s.,&'’/\-]*$", "", text).strip()
+    if without_english_suffix:
+        candidates.add(without_english_suffix)
+    return {award_rule_match_key(candidate) for candidate in candidates if award_rule_match_key(candidate)}
+
+
 def extract_rules_principles(markdown):
     match = re.search(r"## 评优原则(?P<body>.*?)(?:\n## |\Z)", markdown, flags=re.S)
     if not match:
@@ -726,9 +750,9 @@ def load_rule_chunks(path):
         title = match.group(1).strip()
         text = markdown[start:end].strip()
         if text:
-            chunks.append({"title": title, "text": text})
+            chunks.append({"title": title, "award_title": award_rule_title(title), "text": text})
     if not chunks and markdown.strip():
-        chunks.append({"title": path.name, "text": markdown.strip()})
+        chunks.append({"title": path.name, "award_title": award_rule_title(path.name), "text": markdown.strip()})
     return principles, chunks
 
 
@@ -749,58 +773,106 @@ class RuleRetriever:
         self.timeout = timeout
         self.principles, self.chunks = load_rule_chunks(config.rules_path)
         self.doc_embeddings = []
+        self.embedding_cache = {}
         self.embedding_error = ""
-        if self.chunks and config.gateway_embedding_url and config.gateway_embedding_api_key:
-            try:
-                self.doc_embeddings = call_gateway_embeddings(
-                    config,
-                    [chunk["text"] for chunk in self.chunks],
-                    timeout,
-                )
-            except Exception as exc:
-                self.embedding_error = str(exc)
-                self.doc_embeddings = []
+        self.chunk_indexes_by_award_key = {}
+        for index, chunk in enumerate(self.chunks):
+            for key in award_rule_match_keys(chunk.get("award_title") or chunk.get("title")):
+                self.chunk_indexes_by_award_key.setdefault(key, []).append(index)
 
-    def retrieve(self, query, top_n=4):
+    def exact_award_rule_indexes(self, award_name):
+        for key in award_rule_match_keys(award_name):
+            indexes = self.chunk_indexes_by_award_key.get(key)
+            if indexes:
+                return list(indexes)
+        return []
+
+    def missing_award_rule_warning(self, award_name):
+        return {
+            "title": "规则匹配警告",
+            "text": (
+                f"未在规则库标题中精确匹配到申报奖项：{award_name or '未提供'}。"
+                "本次不会跨奖项召回规则；请仅依据申报材料判断证据是否缺失，并标记人工复核。"
+            ),
+            "warning": True,
+            "match_status": "missing_award_rule",
+            "award_name": award_name,
+        }
+
+    def retrieve(self, query, top_n=4, award_name=""):
         if not self.chunks:
-            return []
+            selected = []
+            if self.principles:
+                selected.append({"title": "评优原则", "text": self.principles})
+            selected.append({
+                "title": "规则匹配警告",
+                "text": "规则库为空或不可读取。本次不会跨奖项召回规则；请仅依据申报材料判断证据是否缺失，并标记人工复核。",
+                "warning": True,
+                "match_status": "rules_empty",
+                "award_name": award_name,
+            })
+            return selected
 
-        ranked = []
-        if self.doc_embeddings:
-            try:
-                query_embedding = call_gateway_embeddings(self.config, [query], self.timeout)[0]
-                ranked = [
-                    (index, cosine_similarity(query_embedding, embedding))
-                    for index, embedding in enumerate(self.doc_embeddings)
-                ]
-            except Exception:
-                ranked = []
-        if not ranked:
-            ranked = [
-                (index, keyword_score(query, chunk))
-                for index, chunk in enumerate(self.chunks)
-            ]
+        exact_indexes = self.exact_award_rule_indexes(award_name)
+        if not exact_indexes:
+            selected = []
+            if self.principles:
+                selected.append({"title": "评优原则", "text": self.principles})
+            selected.append(self.missing_award_rule_warning(award_name))
+            return selected
 
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        candidate_indexes = [index for index, _ in ranked[: min(10, len(ranked))]]
-        if self.config.gateway_rerank_url and self.config.gateway_rerank_api_key and candidate_indexes:
-            documents = [self.chunks[index]["text"] for index in candidate_indexes]
-            try:
-                reranked = call_gateway_rerank(self.config, query, documents, self.timeout, top_n)
-                if reranked:
-                    candidate_indexes = [
-                        candidate_indexes[index]
-                        for index, _score in reranked
-                        if 0 <= index < len(candidate_indexes)
+        if len(exact_indexes) == 1:
+            candidate_indexes = exact_indexes
+        else:
+            ranked = []
+            if self.config.gateway_embedding_url and self.config.gateway_embedding_api_key:
+                try:
+                    query_embedding = call_gateway_embeddings(self.config, [query], self.timeout)[0]
+                    missing_indexes = [index for index in exact_indexes if index not in self.embedding_cache]
+                    if missing_indexes:
+                        embeddings = call_gateway_embeddings(
+                            self.config,
+                            [self.chunks[index]["text"] for index in missing_indexes],
+                            self.timeout,
+                        )
+                        for index, embedding in zip(missing_indexes, embeddings):
+                            self.embedding_cache[index] = embedding
+                    ranked = [
+                        (index, cosine_similarity(query_embedding, self.embedding_cache[index]))
+                        for index in exact_indexes
+                        if index in self.embedding_cache
                     ]
-            except Exception:
-                pass
+                except Exception as exc:
+                    self.embedding_error = str(exc)
+                    ranked = []
+            if not ranked:
+                ranked = [
+                    (index, keyword_score(query, self.chunks[index]))
+                    for index in exact_indexes
+                ]
+
+            ranked.sort(key=lambda item: item[1], reverse=True)
+            candidate_indexes = [index for index, _ in ranked[: min(10, len(ranked))]]
+            if self.config.gateway_rerank_url and self.config.gateway_rerank_api_key and len(candidate_indexes) > 1:
+                documents = [self.chunks[index]["text"] for index in candidate_indexes]
+                try:
+                    reranked = call_gateway_rerank(self.config, query, documents, self.timeout, top_n)
+                    if reranked:
+                        candidate_indexes = [
+                            candidate_indexes[index]
+                            for index, _score in reranked
+                            if 0 <= index < len(candidate_indexes)
+                        ]
+                except Exception:
+                    pass
 
         selected = []
         if self.principles:
             selected.append({"title": "评优原则", "text": self.principles})
         for index in candidate_indexes[:top_n]:
-            selected.append(self.chunks[index])
+            chunk = dict(self.chunks[index])
+            chunk["match_status"] = "exact_award_rule"
+            selected.append(chunk)
         return selected
 
 
@@ -955,7 +1027,13 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
             inputs.get("submission_reason_masked", ""),
         ]
     )
-    rule_chunks = rule_retriever.retrieve(query) if rule_retriever else []
+    rule_chunks = rule_retriever.retrieve(query, award_name=inputs.get("award_name", "")) if rule_retriever else []
+    rule_warnings = [chunk for chunk in rule_chunks if chunk.get("warning")]
+    matched_rule_titles = [
+        chunk.get("award_title") or chunk.get("title", "")
+        for chunk in rule_chunks
+        if chunk.get("match_status") == "exact_award_rule"
+    ]
     review_body, review_text, review_json, review_attempts, review_errors = call_gateway_review_json(
         config,
         gateway_review_prompt(inputs, rule_chunks),
@@ -968,6 +1046,9 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
         "review_result_json": review_json,
         "final_fields_json": final_fields_json,
         "retrieved_rules": rule_chunks,
+        "rule_retrieval_match_status": "missing_award_rule" if rule_warnings else "exact_award_rule",
+        "rule_retrieval_warnings": [chunk.get("text", "") for chunk in rule_warnings],
+        "matched_rule_titles": matched_rule_titles,
         "raw_review_text": review_text,
         "raw_final_fields_text": "",
         "final_fields_source": "review_json.final_fields",
@@ -2789,6 +2870,12 @@ def write_internal_pack(path, entries):
                     "missing_evidence": entry["review_json"].get("missing_evidence", []),
                     "risk_flags": entry["review_json"].get("risk_flags", []),
                     "explanation": entry["review_json"].get("explanation", ""),
+                },
+                "rule_retrieval": {
+                    "match_status": entry.get("outputs", {}).get("rule_retrieval_match_status", ""),
+                    "warnings": entry.get("outputs", {}).get("rule_retrieval_warnings", []),
+                    "matched_rule_titles": entry.get("outputs", {}).get("matched_rule_titles", []),
+                    "retrieved_rules": entry.get("outputs", {}).get("retrieved_rules", []),
                 },
                 "final_result_fields": entry["result_row"],
                 "ranking_reason": entry.get("ranking_reason", ""),
