@@ -24,7 +24,7 @@ APP_ROOT = Path(__file__).parents[1].resolve()
 AWARD_REVIEW_DIR = APP_ROOT / "award_review"
 DEFAULT_TEMPLATE_PATH = AWARD_REVIEW_DIR / "评选结果输出格式.xlsx"
 DEFAULT_AWARD_CONFIG_PATH = AWARD_REVIEW_DIR / "award_config.json"
-DEFAULT_RULES_PATH = AWARD_REVIEW_DIR / "2025年度评优规则_知识库版.md"
+DEFAULT_RULES_PATH = AWARD_REVIEW_DIR / "2026集团年中评优奖项及标准_知识库版.md"
 DEFAULT_PREFLIGHT_TIMEOUT = 20
 
 
