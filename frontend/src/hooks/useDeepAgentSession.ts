@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { cancelTask, listSessionFiles, startTask, uploadSessionFiles } from "../lib/api";
+import {
+  cancelTask,
+  createChat,
+  getChatMessages,
+  listSessionFiles,
+  startTask,
+  uploadSessionFiles
+} from "../lib/api";
 import { WS_BASE_URL } from "../lib/config";
-import { createThreadId, getStoredThreadId, storeThreadId } from "../lib/thread";
+import { getStoredThreadId, storeThreadId } from "../lib/thread";
 import type {
+  ChatMessageRecord,
   ConnectionState,
   MonitorMessage,
   OutputFile,
@@ -46,10 +54,7 @@ export function useDeepAgentSession() {
     }
   }, []);
 
-  const resetSession = useCallback(() => {
-    const nextThreadId = createThreadId();
-    storeThreadId(nextThreadId);
-    setThreadId(nextThreadId);
+  const clearSessionState = useCallback(() => {
     setEvents([]);
     setFiles([]);
     setSessionPath("");
@@ -60,6 +65,30 @@ export function useDeepAgentSession() {
     setIsRunning(false);
     setIsCancelling(false);
   }, []);
+
+  const resetSession = useCallback(async () => {
+    const response = await createChat();
+    storeThreadId(response.thread.id);
+    setThreadId(response.thread.id);
+    clearSessionState();
+    return response.thread;
+  }, [clearSessionState]);
+
+  const hydrateMessages = useCallback(async (targetThreadId = threadId): Promise<ChatMessageRecord[]> => {
+    const response = await getChatMessages(targetThreadId);
+    setSessionPath(response.messages.length > 0 ? response.thread.session_path || "" : "");
+    setLastError("");
+    return response.messages;
+  }, [threadId]);
+
+  const switchSession = useCallback(async (nextThreadId: string): Promise<ChatMessageRecord[]> => {
+    const response = await getChatMessages(nextThreadId);
+    storeThreadId(nextThreadId);
+    setThreadId(nextThreadId);
+    clearSessionState();
+    setSessionPath(response.messages.length > 0 ? response.thread.session_path || "" : "");
+    return response.messages;
+  }, [clearSessionState]);
 
   const refreshFiles = useCallback(async () => {
     if (!sessionPath) {
@@ -305,6 +334,7 @@ export function useDeepAgentSession() {
     isUploading,
     lastError,
     lastPongAt,
+    hydrateMessages,
     refreshFiles,
     resetSession,
     result,
@@ -312,6 +342,7 @@ export function useDeepAgentSession() {
     stats,
     cancelCurrentTask,
     submitTask,
+    switchSession,
     threadId,
     uploadFiles,
     uploadedItems

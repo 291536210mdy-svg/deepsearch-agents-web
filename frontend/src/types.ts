@@ -53,6 +53,49 @@ export interface FileListResponse {
   error?: string;
 }
 
+export interface ChatThreadRecord {
+  id: string;
+  user_id: string;
+  title: string;
+  status: "regular" | "archived" | "deleted" | string;
+  session_path: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface ChatMessageRecord {
+  id: number;
+  thread_id: string;
+  role: "user" | "assistant" | "system" | "tool" | "event" | string;
+  content: string;
+  event_type: string;
+  event_json: Record<string, unknown> | null;
+  files_json: unknown;
+  created_at: string;
+}
+
+export interface ChatListResponse {
+  items: ChatThreadRecord[];
+  has_more: boolean;
+  next_before?: string | null;
+}
+
+export interface ChatThreadResponse {
+  thread: ChatThreadRecord;
+}
+
+export interface ChatMessagesResponse {
+  thread: ChatThreadRecord;
+  messages: ChatMessageRecord[];
+}
+
+export interface DeleteChatResponse {
+  status: "deleted" | string;
+  thread_id: string;
+}
+
 export interface UploadedItem {
   uid: string;
   name: string;

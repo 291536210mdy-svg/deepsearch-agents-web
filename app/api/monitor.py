@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from fastapi import WebSocket
 
+from app.api import chat_history
 from app.api.context import get_thread_context
 
 
@@ -125,6 +126,17 @@ class ToolMonitor:
 
     def report_task_result(self, result: str) -> None:
         """报告任务最终结果"""
+        thread_id = get_thread_context()
+        if thread_id:
+            try:
+                chat_history.append_message(
+                    thread_id,
+                    "assistant",
+                    result,
+                    event_type="task_result",
+                )
+            except Exception as exc:
+                print(f"[Monitor] Chat history persist failed: {exc}")
         self._emit("task_result", "任务执行完成", {"result": result})
 
     def report_task_cancelled(self) -> None:

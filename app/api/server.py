@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.api import chat_history
 from app.agent.main_agent import run_deep_agent
 from app.api.monitor import manager
 
@@ -84,6 +85,107 @@ class TaskRequest(BaseModel):
     thread_id: str = None
 
 
+class ChatCreateRequest(BaseModel):
+    title: str | None = None
+    thread_id: str | None = None
+
+
+class ChatUpdateRequest(BaseModel):
+    title: str | None = None
+    status: str | None = None
+
+
+class ChatMessageRequest(BaseModel):
+    role: str
+    content: str | None = None
+    event_type: str | None = None
+    event_json: dict | None = None
+    files_json: list | dict | None = None
+
+
+async def run_history_call(func, *args, **kwargs):
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"聊天历史数据库不可用：{exc}") from exc
+
+
+@app.get("/api/chats")
+async def list_chats(limit: int = 20, before: str | None = None):
+    return await run_history_call(chat_history.list_threads, limit=limit, before=before)
+
+
+@app.post("/api/chats")
+async def create_chat(request: ChatCreateRequest):
+    thread_id = request.thread_id or str(uuid.uuid4())
+    session_path = str((output_dir / f"session_{thread_id}").resolve())
+    title = request.title or "新对话"
+    thread = await run_history_call(
+        chat_history.create_thread,
+        thread_id=thread_id,
+        title=title,
+        session_path=session_path,
+    )
+    return {"thread": thread}
+
+
+@app.get("/api/chats/{thread_id}")
+async def get_chat(thread_id: str):
+    thread = await run_history_call(chat_history.get_thread, thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    return {"thread": thread}
+
+
+@app.patch("/api/chats/{thread_id}")
+async def update_chat(thread_id: str, request: ChatUpdateRequest):
+    if request.status and request.status not in {"regular", "archived", "deleted"}:
+        raise HTTPException(status_code=400, detail="无效的聊天状态")
+    thread = await run_history_call(
+        chat_history.update_thread,
+        thread_id,
+        title=request.title,
+        status=request.status,
+    )
+    if not thread:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    return {"thread": thread}
+
+
+@app.delete("/api/chats/{thread_id}")
+async def delete_chat(thread_id: str):
+    deleted = await run_history_call(chat_history.soft_delete_thread, thread_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    return {"status": "deleted", "thread_id": thread_id}
+
+
+@app.get("/api/chats/{thread_id}/messages")
+async def list_chat_messages(thread_id: str, limit: int = 200):
+    thread = await run_history_call(chat_history.get_thread, thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    messages = await run_history_call(chat_history.list_messages, thread_id, limit=limit)
+    return {"thread": thread, "messages": messages}
+
+
+@app.post("/api/chats/{thread_id}/messages")
+async def create_chat_message(thread_id: str, request: ChatMessageRequest):
+    if request.role not in {"user", "assistant", "system", "tool", "event"}:
+        raise HTTPException(status_code=400, detail="无效的消息角色")
+    await run_history_call(chat_history.ensure_chat_thread, thread_id)
+    message = await run_history_call(
+        chat_history.append_message,
+        thread_id,
+        request.role,
+        request.content,
+        event_type=request.event_type,
+        event_json=request.event_json,
+        files_json=request.files_json,
+    )
+    return {"message": message}
+
+
 def _forget_task(thread_id: str, task: asyncio.Task) -> None:
     """
     清理已结束任务的登记关系。
@@ -104,6 +206,18 @@ async def run_task(request: TaskRequest):
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
     """
     thread_id = request.thread_id or str(uuid.uuid4())
+    clean_query = request.query.strip()
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="任务内容不能为空")
+
+    session_path = str((output_dir / f"session_{thread_id}").resolve())
+    await run_history_call(
+        chat_history.ensure_chat_thread,
+        thread_id,
+        title=chat_history.thread_title_from_query(clean_query),
+        session_path=session_path,
+    )
+    await run_history_call(chat_history.append_message, thread_id, "user", clean_query)
 
     # 同一个 thread_id 只保留一个活跃任务，新任务会先取消旧任务，避免并发写同一会话目录
     old_task = active_tasks.get(thread_id)
@@ -111,7 +225,7 @@ async def run_task(request: TaskRequest):
         old_task.cancel()
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(run_deep_agent(request.query, thread_id))
+    task = asyncio.create_task(run_deep_agent(clean_query, thread_id))
     active_tasks[thread_id] = task
     task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
 

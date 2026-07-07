@@ -1,5 +1,14 @@
 import { API_BASE_URL } from "./config";
-import type { CancelTaskResponse, FileListResponse, TaskResponse, UploadResponse } from "../types";
+import type {
+  CancelTaskResponse,
+  ChatListResponse,
+  ChatMessagesResponse,
+  ChatThreadResponse,
+  DeleteChatResponse,
+  FileListResponse,
+  TaskResponse,
+  UploadResponse
+} from "../types";
 
 function apiUrl(path: string): string {
   return `${API_BASE_URL}${path}`;
@@ -34,6 +43,37 @@ export async function startTask(query: string, threadId: string): Promise<TaskRe
       thread_id: threadId
     })
   });
+}
+
+export async function listChats(limit = 20, before?: string): Promise<ChatListResponse> {
+  const url = new URL(apiUrl("/api/chats"));
+  url.searchParams.set("limit", String(limit));
+  if (before) {
+    url.searchParams.set("before", before);
+  }
+  return requestJson<ChatListResponse>(url);
+}
+
+export async function createChat(title?: string): Promise<ChatThreadResponse> {
+  return requestJson<ChatThreadResponse>(apiUrl("/api/chats"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ title })
+  });
+}
+
+export async function deleteChat(threadId: string): Promise<DeleteChatResponse> {
+  return requestJson<DeleteChatResponse>(apiUrl(`/api/chats/${encodeURIComponent(threadId)}`), {
+    method: "DELETE"
+  });
+}
+
+export async function getChatMessages(threadId: string): Promise<ChatMessagesResponse> {
+  return requestJson<ChatMessagesResponse>(
+    apiUrl(`/api/chats/${encodeURIComponent(threadId)}/messages`)
+  );
 }
 
 export async function cancelTask(threadId: string): Promise<CancelTaskResponse> {

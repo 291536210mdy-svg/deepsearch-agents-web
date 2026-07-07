@@ -8,13 +8,15 @@ import {
   ToolOutlined,
   TrophyOutlined
 } from "@ant-design/icons";
-import { Alert, App as AntApp, Button } from "antd";
+import { Alert, App as AntApp } from "antd";
 import { useEffect, useRef, useState } from "react";
+import { ChatHistorySidebar } from "./components/ChatHistorySidebar";
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationThread } from "./components/ConversationThread";
 import type { ChatTurn } from "./components/ConversationThread";
+import { useChatHistory } from "./hooks/useChatHistory";
 import { useDeepAgentSession } from "./hooks/useDeepAgentSession";
-import type { ConnectionState, UploadedItem } from "./types";
+import type { ChatMessageRecord, ConnectionState, UploadedItem } from "./types";
 
 function connectionLabel(state: ConnectionState): string {
   const labels: Record<ConnectionState, string> = {
@@ -38,6 +40,46 @@ function createTurn(content: string): ChatTurn {
   };
 }
 
+function turnsFromMessages(messages: ChatMessageRecord[]): ChatTurn[] {
+  const turns: ChatTurn[] = [];
+  let latestUserTurn: ChatTurn | null = null;
+
+  messages.forEach((item) => {
+    if (item.role === "user") {
+      latestUserTurn = {
+        id: `history-user-${item.id}`,
+        content: item.content,
+        events: [],
+        files: [],
+        isRunning: false,
+        result: "",
+        timestamp: item.created_at
+      };
+      turns.push(latestUserTurn);
+      return;
+    }
+
+    if (item.role === "assistant") {
+      if (latestUserTurn && !latestUserTurn.result) {
+        latestUserTurn.result = item.content;
+        latestUserTurn.isRunning = false;
+      } else {
+        turns.push({
+          id: `history-assistant-${item.id}`,
+          content: "历史结果",
+          events: [],
+          files: [],
+          isRunning: false,
+          result: item.content,
+          timestamp: item.created_at
+        });
+      }
+    }
+  });
+
+  return turns;
+}
+
 export default function App() {
   const { message } = AntApp.useApp();
   const [query, setQuery] = useState("");
@@ -45,6 +87,7 @@ export default function App() {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const streamRef = useRef<HTMLElement | null>(null);
   const session = useDeepAgentSession();
+  const chatHistory = useChatHistory();
 
   useEffect(() => {
     setTurns((previous) => {
@@ -79,6 +122,12 @@ export default function App() {
     });
   }, [turns]);
 
+  useEffect(() => {
+    if (session.result) {
+      void chatHistory.refresh();
+    }
+  }, [chatHistory.refresh, session.result]);
+
   async function handleSubmit() {
     const cleanQuery = query.trim();
     if (!cleanQuery) {
@@ -92,6 +141,7 @@ export default function App() {
 
     try {
       await session.submitTask(cleanQuery);
+      void chatHistory.refresh();
       message.success("任务已启动，执行过程会显示在对话中");
     } catch (error) {
       setTurns((previous) =>
@@ -128,11 +178,45 @@ export default function App() {
     }
   }
 
-  function handleNewSession() {
-    session.resetSession();
-    setTurns([]);
-    setQuery("");
-    setStagedItems([]);
+  async function handleNewSession() {
+    try {
+      await session.resetSession();
+      setTurns([]);
+      setQuery("");
+      setStagedItems([]);
+      await chatHistory.refresh();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "新建对话失败");
+    }
+  }
+
+  async function handleSelectThread(threadId: string) {
+    if (threadId === session.threadId) {
+      return;
+    }
+    if (session.isRunning) {
+      message.warning("当前任务正在执行，完成或取消后再切换对话");
+      return;
+    }
+    try {
+      const messages = await session.switchSession(threadId);
+      setTurns(turnsFromMessages(messages));
+      setQuery("");
+      setStagedItems([]);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "加载历史对话失败");
+    }
+  }
+
+  async function handleDeleteThread(threadId: string) {
+    try {
+      await chatHistory.removeThread(threadId);
+      if (threadId === session.threadId) {
+        await handleNewSession();
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "删除对话失败");
+    }
   }
 
   const online = session.connectionState === "connected";
@@ -145,9 +229,19 @@ export default function App() {
           <p>TMOD智能员工</p>
         </div>
 
-        <Button className="new-chat-button" block onClick={handleNewSession}>
-          新建对话
-        </Button>
+        <ChatHistorySidebar
+          currentThreadId={session.threadId}
+          error={chatHistory.error}
+          hasMore={chatHistory.hasMore}
+          isLoading={chatHistory.isLoading}
+          isLoadingMore={chatHistory.isLoadingMore}
+          onDeleteThread={handleDeleteThread}
+          onLoadMore={chatHistory.loadMore}
+          onNewThread={handleNewSession}
+          onRefresh={chatHistory.refresh}
+          onSelectThread={handleSelectThread}
+          threads={chatHistory.threads}
+        />
 
         <div className="sidebar-status-list">
           <div className={`sidebar-status ${online ? "sidebar-status--online" : "sidebar-status--warn"}`}>
