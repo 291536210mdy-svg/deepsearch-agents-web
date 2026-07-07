@@ -198,6 +198,10 @@ def run_award_review(
             limit=0,
             award_filters=[],
             generate_qa_report=False,
+            candidate_concurrency=int(
+                os.getenv("AWARD_REVIEW_CANDIDATE_CONCURRENCY", str(rb.DEFAULT_CANDIDATE_CONCURRENCY))
+                or rb.DEFAULT_CANDIDATE_CONCURRENCY
+            ),
             enable_leadership_priority=True,
             model_backend=os.getenv("REVIEW_MODEL_BACKEND", "gateway"),
             gateway_chat_url=os.getenv("AI_GATEWAY_CHAT_URL", ""),

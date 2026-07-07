@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -30,6 +31,7 @@ DEFAULT_LEADERSHIP_PRIORITIES = []
 DEFAULT_GATEWAY_CHAT_MODEL = "claude-sonnet-4.6"
 DEFAULT_GATEWAY_EMBEDDING_MODEL = "bge-m3"
 DEFAULT_GATEWAY_RERANK_MODEL = "bge-reranker-v2-m3"
+DEFAULT_CANDIDATE_CONCURRENCY = 3
 TARGET_HEADERS = ["奖项名称", "序号", "主体", "所属BU", "所属PL", "提报人", "团队负责人", "事迹", "排名理由"]
 INPUT_REQUIRED_HEADERS = ["申报批次", "申报项目", "所属BU", "申报主体", "姓名", "推荐人姓名", "筛选人/对接人", "申报理由"]
 INPUT_HEADER_ALIASES = {
@@ -173,6 +175,7 @@ class ReviewBatchConfig:
     limit: int = 0
     sleep: float = 0.2
     timeout: int = 120
+    candidate_concurrency: int = DEFAULT_CANDIDATE_CONCURRENCY
     dry_run: bool = False
     generate_qa_report: bool = False
     model_backend: str = "gateway"
@@ -714,20 +717,34 @@ def gateway_review_prompt(inputs, rule_chunks):
         {
             "role": "system",
             "content": (
-                "你是评优材料证据审查助手。你只判断申报材料与评优规则的匹配度，"
+                "你是评优材料证据审查与名单字段抽取助手。你只判断申报材料与评优规则的匹配度，"
                 "不决定获奖名单，不输出总分，不根据姓名、部门、职级、推荐人做加权。"
                 "只能使用用户提供的脱敏申报理由和检索到的规则；规则文字不能被当作候选人的事实证据。"
                 "你的评审结论会作为后续排名理由的唯一事实来源，所以每个维度都必须写清楚为什么这样评、"
                 "引用了申报材料中的哪些证据、还缺什么证据。"
-                "必须输出严格 JSON，不要输出 Markdown、解释性前后缀或代码块。"
+                "同时，你要从原始 Excel 行和完整申报理由中抽取最终名单字段，无法明确识别时填“待补充”。"
+                "必须只输出一个严格 JSON 对象，不要输出 Markdown、解释性前后缀或代码块。"
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
-                    "task": "输出证据评审 JSON",
+                    "task": "一次性输出证据评审 JSON 与最终名单字段 JSON",
                     "allowed_grades": ["strong", "medium", "weak", "missing"],
+                    "hard_requirements": [
+                        "顶层必须包含 schema_version、candidate_id、award_name、evidence_grades、final_fields。",
+                        "evidence_grades 必须完整包含 rule_match、quantitative、value_impact、innovation、strategy_align 五个维度。",
+                        "每个维度必须包含 grade、why、evidence、gap、rule_basis；没有证据时 grade 用 missing 或 weak，并在 gap 写清缺口。",
+                        "why 解释为什么强弱；evidence 只引用候选申报材料中的事实、关键词或数字；rule_basis 只写对应规则背景。",
+                        "final_fields 只做字段抽取，不做评奖；无法明确识别的字段填“待补充”，并放入 needs_completion。",
+                    ],
+                    "grading_rubric": {
+                        "strong": "候选材料有明确事实，且能直接支撑该维度；最好包含数字、结果、对象或落地影响。",
+                        "medium": "候选材料有相关事实，但量化、口径、影响范围或与规则的连接不完整。",
+                        "weak": "候选材料只泛泛描述，和该维度有关但证据较薄，或主要靠推断。",
+                        "missing": "候选材料没有提供该维度可用事实。",
+                    },
                     "dimension_instructions": {
                         "rule_match": "说明申报理由与奖项规则匹配或不匹配在哪里。",
                         "quantitative": "说明是否出现收入、增长率、数量、效率、周期、成本等量化结果，以及口径是否充分。",
@@ -740,6 +757,8 @@ def gateway_review_prompt(inputs, rule_chunks):
                         "award_name": inputs.get("award_name", ""),
                         "award_type": inputs.get("award_type", ""),
                         "submission_reason_masked": inputs.get("submission_reason_masked", ""),
+                        "submission_reason_full": inputs.get("submission_reason_full", ""),
+                        "raw_row_json": inputs.get("raw_row_json", ""),
                     },
                     "retrieved_rules": rules_context_text(rule_chunks),
                     "output_schema": {
@@ -757,6 +776,22 @@ def gateway_review_prompt(inputs, rule_chunks):
                         "matched_rules": [],
                         "missing_evidence": [],
                         "risk_flags": [],
+                        "final_fields": {
+                            "schema_version": "final_fields_v1",
+                            "subject": "",
+                            "submitter": "",
+                            "team_leader": "",
+                            "team_members": "",
+                            "achievement": "",
+                            "needs_completion": [],
+                            "field_confidence": {
+                                "subject": "high|medium|low",
+                                "submitter": "high|medium|low",
+                                "team_leader": "high|medium|low",
+                                "team_members": "high|medium|low",
+                                "achievement": "high|medium|low",
+                            },
+                        },
                         "explanation": "",
                     },
                 },
@@ -825,13 +860,7 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
         gateway_review_prompt(inputs, rule_chunks),
         timeout,
     )
-    final_body, final_text = call_gateway_chat(
-        config,
-        gateway_final_fields_prompt(inputs),
-        timeout,
-        json_mode=True,
-    )
-    final_fields_json = parse_json_maybe(final_text)
+    final_fields_json = extract_final_fields_from_review(review_json)
     status = "failed" if review_errors else "succeeded"
     review_validation_error = "; ".join(review_errors)
     outputs = {
@@ -839,7 +868,8 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
         "final_fields_json": final_fields_json,
         "retrieved_rules": rule_chunks,
         "raw_review_text": review_text,
-        "raw_final_fields_text": final_text,
+        "raw_final_fields_text": "",
+        "final_fields_source": "review_json.final_fields",
         "review_attempts": review_attempts,
         "review_retry_count": max(0, len(review_attempts) - 1),
         "review_schema_valid": not review_errors,
@@ -859,11 +889,7 @@ def call_gateway_review_workflow(config, inputs, rule_retriever, timeout):
                 "usage": review_body.get("usage", {}),
                 "attempts": review_attempts,
             },
-            "final_fields": {
-                "id": final_body.get("id", ""),
-                "model": final_body.get("model", config.gateway_chat_model),
-                "usage": final_body.get("usage", {}),
-            },
+            "final_fields": {"source": "review_json.final_fields"},
         },
     }
     return body, outputs
@@ -1024,6 +1050,33 @@ def validate_review_json(review_json):
     return errors
 
 
+def extract_final_fields_from_review(review_json):
+    if not isinstance(review_json, dict):
+        return {}
+    for key in ("final_fields", "final_fields_json"):
+        value = review_json.get(key)
+        if isinstance(value, dict):
+            return value
+        parsed = parse_json_maybe(value)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    return {}
+
+
+def validate_review_final_fields(review_json):
+    final_fields = extract_final_fields_from_review(review_json)
+    if not isinstance(final_fields, dict) or not final_fields:
+        return ["missing final_fields object"]
+    missing = [
+        field_name
+        for field_name in ("subject", "submitter", "team_leader", "team_members", "achievement")
+        if field_name not in final_fields
+    ]
+    if missing:
+        return [f"missing final_fields.{field_name}" for field_name in missing]
+    return []
+
+
 def review_retry_message(errors, raw_text):
     return {
         "role": "user",
@@ -1037,6 +1090,7 @@ def review_retry_message(errors, raw_text):
                     "必须包含 evidence_grades，且包含 rule_match、quantitative、value_impact、innovation、strategy_align 五个维度。",
                     "每个维度必须包含 grade，并且 grade 只能是 strong、medium、weak、missing。",
                     "每个维度必须写清 why/reason/evidence/gap/rule_basis 中至少一个可审计依据。",
+                    "必须包含 final_fields 对象，且包含 subject、submitter、team_leader、team_members、achievement。",
                 ],
             },
             ensure_ascii=False,
@@ -1055,7 +1109,7 @@ def call_gateway_review_json(config, messages, timeout, *, max_attempts=2):
     for attempt_index in range(1, max_attempts + 1):
         body, text = call_gateway_chat(config, current_messages, timeout, json_mode=True)
         parsed = parse_json_maybe(text)
-        errors = validate_review_json(parsed)
+        errors = validate_review_json(parsed) + validate_review_final_fields(parsed)
         attempts.append(
             {
                 "attempt": attempt_index,
@@ -2939,112 +2993,158 @@ def run_review_batch(config, event_sink=None, should_cancel=None):
     completion_path = output_dir / f"待补充清单_{stamp}.xlsx"
     qa_report_path = output_dir / f"qa_report_{stamp}.json"
 
-    candidate_entries = []
-    with jsonl_path.open("w", encoding="utf-8") as jsonl:
-        for idx, record in enumerate(records, start=1):
-            if cancelled():
-                raise RunCancelled()
-            inputs = build_workflow_inputs(record)
-            sink.emit(
-                "candidate:started",
-                message=f"第 {idx}/{len(records)} 行开始",
-                progress=(idx - 1, len(records)),
-                payload={"candidate_id": inputs["candidate_id"], "award_name": inputs["award_name"]},
-            )
-            workflow_status = "dry_run" if config.dry_run else "pending"
-            error = ""
-            outputs = {}
-            response_body = {}
-            review_json = {}
-            final_fields_json = {}
-            try:
-                if not config.dry_run:
-                    if backend == "dify":
-                        response_body, outputs = call_dify_workflow(base_url, api_key, inputs, user, config.timeout)
-                    else:
-                        response_body, outputs = call_gateway_review_workflow(config, inputs, rule_retriever, config.timeout)
-                    workflow_status = response_body.get("data", {}).get("status", "succeeded")
-                    review_json = parse_json_maybe(outputs.get("review_result_json"))
-                    final_fields_json = parse_json_maybe(outputs.get("final_fields_json"))
-                    review_errors = validate_review_json(review_json)
-                    if review_errors:
-                        workflow_status = "failed"
-                        error = response_body.get("data", {}).get("error", "") or "; ".join(review_errors)
-                        outputs.setdefault("review_schema_valid", False)
-                        outputs.setdefault("review_validation_error", error)
-                    else:
-                        error = response_body.get("data", {}).get("error", "")
-            except Exception as exc:
-                workflow_status = "failed"
-                error = str(exc)
+    def process_candidate_record(idx, record, inputs):
+        workflow_status = "dry_run" if config.dry_run else "pending"
+        error = ""
+        outputs = {}
+        response_body = {}
+        review_json = {}
+        final_fields_json = {}
+        try:
+            if not config.dry_run:
+                if backend == "dify":
+                    response_body, outputs = call_dify_workflow(base_url, api_key, inputs, user, config.timeout)
+                else:
+                    response_body, outputs = call_gateway_review_workflow(config, inputs, rule_retriever, config.timeout)
+                workflow_status = response_body.get("data", {}).get("status", "succeeded")
+                review_json = parse_json_maybe(outputs.get("review_result_json"))
+                final_fields_json = parse_json_maybe(outputs.get("final_fields_json"))
+                review_errors = validate_review_json(review_json)
+                if review_errors:
+                    workflow_status = "failed"
+                    error = response_body.get("data", {}).get("error", "") or "; ".join(review_errors)
+                    outputs.setdefault("review_schema_valid", False)
+                    outputs.setdefault("review_validation_error", error)
+                else:
+                    error = response_body.get("data", {}).get("error", "")
+        except Exception as exc:
+            workflow_status = "failed"
+            error = str(exc)
 
-            result_row, field_sources = build_result_row(idx, record, final_fields_json)
-            current_award_config = get_award_config(award_config, inputs["award_name"])
-            score_detail = calculate_score(review_json, current_award_config)
-            leadership_priority = match_leadership_priority(record["values"], inputs["award_name"], leadership_priorities)
-            internal_score, leadership_priority = apply_leadership_priority(score_detail["score"], leadership_priority)
-            score_detail["leadership_priority"] = leadership_priority
-            entry = {
-                "candidate_id": inputs["candidate_id"],
-                "excel_row": record["excel_row"],
-                "batch_id": inputs["batch_id"],
-                "award_name": inputs["award_name"],
-                "award_type": inputs["award_type"],
-                "workflow_status": workflow_status,
-                "error": error,
-                "outputs": outputs,
-                "response_body": response_body,
-                "inputs": inputs,
-                "record": record,
-                "review_json": review_json,
-                "final_fields_json": final_fields_json,
-                "result_row": result_row,
-                "field_sources": field_sources,
-                "score_detail": score_detail,
-                "normal_review_score": score_detail["score"],
-                "internal_score": internal_score,
-                "leadership_priority": leadership_priority,
-                "tie_break_score": tie_break_score(record["values"], current_award_config),
-                "manual_review_required": False if config.dry_run else needs_manual_review(review_json, workflow_status),
-                "completion_fields": completion_fields(result_row, final_fields_json),
-                "recommendation_status": "pending",
-                "award_rank": "",
-                "recommended_quota": int(current_award_config.get("quota", config.top_n) or config.top_n),
-            }
-            candidate_entries.append(entry)
-            jsonl.write(
-                json.dumps(
-                    {
-                        "inputs": inputs,
-                        "outputs": outputs,
-                        "response": response_body,
-                        "workflow_status": workflow_status,
-                        "error": error,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-            jsonl.flush()
-            print(f"[{idx}/{len(records)}] {inputs['candidate_id']} {inputs['award_name']} -> {workflow_status}", flush=True)
-            if workflow_status in {"succeeded", "dry_run"}:
+        result_row, field_sources = build_result_row(idx, record, final_fields_json)
+        current_award_config = get_award_config(award_config, inputs["award_name"])
+        score_detail = calculate_score(review_json, current_award_config)
+        leadership_priority = match_leadership_priority(record["values"], inputs["award_name"], leadership_priorities)
+        internal_score, leadership_priority = apply_leadership_priority(score_detail["score"], leadership_priority)
+        score_detail["leadership_priority"] = leadership_priority
+        entry = {
+            "candidate_id": inputs["candidate_id"],
+            "excel_row": record["excel_row"],
+            "batch_id": inputs["batch_id"],
+            "award_name": inputs["award_name"],
+            "award_type": inputs["award_type"],
+            "workflow_status": workflow_status,
+            "error": error,
+            "outputs": outputs,
+            "response_body": response_body,
+            "inputs": inputs,
+            "record": record,
+            "review_json": review_json,
+            "final_fields_json": final_fields_json,
+            "result_row": result_row,
+            "field_sources": field_sources,
+            "score_detail": score_detail,
+            "normal_review_score": score_detail["score"],
+            "internal_score": internal_score,
+            "leadership_priority": leadership_priority,
+            "tie_break_score": tie_break_score(record["values"], current_award_config),
+            "manual_review_required": False if config.dry_run else needs_manual_review(review_json, workflow_status),
+            "completion_fields": completion_fields(result_row, final_fields_json),
+            "recommendation_status": "pending",
+            "award_rank": "",
+            "recommended_quota": int(current_award_config.get("quota", config.top_n) or config.top_n),
+        }
+        raw_payload = {
+            "inputs": inputs,
+            "outputs": outputs,
+            "response": response_body,
+            "workflow_status": workflow_status,
+            "error": error,
+        }
+        if not config.dry_run and config.sleep:
+            time.sleep(config.sleep)
+        return entry, raw_payload
+
+    candidate_entries = []
+    total_records = len(records)
+    worker_count = max(1, min(int(config.candidate_concurrency or 1), total_records or 1))
+    sink.emit(
+        "candidate:concurrency",
+        message=f"候选行处理并发数：{worker_count}",
+        progress=(0, total_records),
+        payload={"concurrency": worker_count, "total": total_records},
+    )
+    indexed_records = list(enumerate(records, start=1))
+    next_record_index = 0
+    completed_count = 0
+
+    with jsonl_path.open("w", encoding="utf-8") as jsonl:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+
+            def submit_next_candidate():
+                nonlocal next_record_index
+                if next_record_index >= total_records:
+                    return
+                idx, record = indexed_records[next_record_index]
+                next_record_index += 1
+                inputs = build_workflow_inputs(record)
                 sink.emit(
-                    "candidate:reviewed",
-                    message=f"第 {idx}/{len(records)} 行完成",
-                    progress=(idx, len(records)),
-                    payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status},
+                    "candidate:started",
+                    message=f"第 {idx}/{total_records} 行开始",
+                    progress=(completed_count, total_records),
+                    payload={"candidate_id": inputs["candidate_id"], "award_name": inputs["award_name"]},
                 )
-            else:
-                error_preview = truncate_text(error, 240) if error else "未返回错误详情"
-                sink.emit(
-                    "candidate:failed",
-                    message=f"第 {idx}/{len(records)} 行失败：{error_preview}",
-                    level="warn",
-                    progress=(idx, len(records)),
-                    payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status, "error": error},
-                )
-            if not config.dry_run and config.sleep:
-                time.sleep(config.sleep)
+                future = executor.submit(process_candidate_record, idx, record, inputs)
+                futures[future] = (idx, inputs)
+
+            for _ in range(worker_count):
+                if cancelled():
+                    raise RunCancelled()
+                submit_next_candidate()
+
+            while futures:
+                if cancelled():
+                    for future in futures:
+                        future.cancel()
+                    raise RunCancelled()
+                done, _pending = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for future in done:
+                    idx, inputs = futures.pop(future)
+                    entry, raw_payload = future.result()
+                    candidate_entries.append(entry)
+                    completed_count += 1
+                    jsonl.write(json.dumps(raw_payload, ensure_ascii=False) + "\n")
+                    jsonl.flush()
+
+                    workflow_status = entry["workflow_status"]
+                    print(
+                        f"[{completed_count}/{total_records}] {inputs['candidate_id']} {inputs['award_name']} -> {workflow_status}",
+                        flush=True,
+                    )
+                    if workflow_status in {"succeeded", "dry_run"}:
+                        sink.emit(
+                            "candidate:reviewed",
+                            message=f"第 {idx}/{total_records} 行完成",
+                            progress=(completed_count, total_records),
+                            payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status},
+                        )
+                    else:
+                        error = entry.get("error", "")
+                        error_preview = truncate_text(error, 240) if error else "未返回错误详情"
+                        sink.emit(
+                            "candidate:failed",
+                            message=f"第 {idx}/{total_records} 行失败：{error_preview}",
+                            level="warn",
+                            progress=(completed_count, total_records),
+                            payload={"candidate_id": inputs["candidate_id"], "workflow_status": workflow_status, "error": error},
+                        )
+                    submit_next_candidate()
+
+    candidate_entries.sort(key=lambda entry: entry["excel_row"])
 
     if cancelled():
         raise RunCancelled()
@@ -3139,6 +3239,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="仅处理前 N 行，0 表示全部")
     parser.add_argument("--sleep", type=float, default=0.2, help="每行调用后的暂停秒数")
     parser.add_argument("--timeout", type=int, default=120, help="模型 API 超时时间，秒")
+    parser.add_argument("--candidate-concurrency", type=int, default=0, help="候选行评审并发数，默认读取 AWARD_REVIEW_CANDIDATE_CONCURRENCY 或 3")
     parser.add_argument("--dry-run", action="store_true", help="只生成 Workflow 输入，不调用模型")
     args = parser.parse_args()
 
@@ -3171,6 +3272,10 @@ def main():
         limit=args.limit,
         sleep=args.sleep,
         timeout=args.timeout,
+        candidate_concurrency=(
+            args.candidate_concurrency
+            or int(os.environ.get("AWARD_REVIEW_CANDIDATE_CONCURRENCY", str(DEFAULT_CANDIDATE_CONCURRENCY)) or DEFAULT_CANDIDATE_CONCURRENCY)
+        ),
         dry_run=args.dry_run,
         generate_qa_report=True,
         model_backend=model_backend,
