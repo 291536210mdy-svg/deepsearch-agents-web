@@ -18,7 +18,9 @@ from openpyxl.utils import get_column_letter
 
 
 WORKSPACE = Path(__file__).resolve().parent
+PROJECT_ROOT = WORKSPACE.parent.parent
 DEFAULT_ENV_FILES = [
+    PROJECT_ROOT / ".env",
     WORKSPACE / ".env",
     Path(r"E:\Agent学习\my_project\.env"),
 ]
@@ -466,6 +468,39 @@ def openai_endpoint_url(base_url, endpoint):
     return f"{base}/v1/{endpoint}"
 
 
+def dashscope_api_base_url(base_url):
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return base
+    service_marker = "/api/v1/services/"
+    if service_marker in base:
+        return base.split(service_marker, 1)[0] + "/api/v1"
+    for suffix in ("/compatible-mode/v1", "/compatible-api/v1", "/api/v1"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)] + "/api/v1"
+    return f"{base}/api/v1"
+
+
+def dashscope_service_url(base_url, service_path):
+    base = str(base_url or "").strip().rstrip("/")
+    service_path = str(service_path or "").strip("/")
+    if not base or not service_path:
+        return base
+    if base.endswith(f"/{service_path}") or base.endswith(service_path):
+        return base
+    return f"{dashscope_api_base_url(base)}/{service_path}"
+
+
+def uses_dashscope_multimodal_embedding(model):
+    name = str(model or "").lower()
+    return any(token in name for token in ("vl-embedding", "embedding-vision", "multimodal-embedding"))
+
+
+def uses_dashscope_service_rerank(model):
+    name = str(model or "").lower()
+    return "vl-rerank" in name or "gte-rerank" in name
+
+
 def call_json_post(url, api_key, payload, timeout):
     response = requests.post(
         url,
@@ -528,34 +563,76 @@ def call_gateway_chat(config, messages, timeout, *, max_tokens=4000, json_mode=F
 
 
 def embeddings_from_response(body):
-    data = body.get("data")
-    if isinstance(data, list):
-        embeddings = []
-        for item in data:
-            if isinstance(item, dict) and isinstance(item.get("embedding"), list):
-                embeddings.append(item["embedding"])
+    def parse_items(items):
+        if not isinstance(items, list):
+            return []
+        parsed = []
+        for order, item in enumerate(items):
+            if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                continue
+            index = item.get("index")
+            try:
+                sort_index = int(index if index is not None else order)
+            except (TypeError, ValueError):
+                sort_index = order
+            parsed.append((sort_index, item["embedding"]))
+        if not parsed:
+            return []
+        parsed.sort(key=lambda item: item[0])
+        return [embedding for _index, embedding in parsed]
+
+    output = body.get("output")
+    if isinstance(output, dict):
+        embeddings = parse_items(output.get("embeddings"))
         if embeddings:
             return embeddings
+    data = body.get("data")
+    embeddings = parse_items(data)
+    if embeddings:
+        return embeddings
     embeddings = body.get("embeddings")
     if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
         return embeddings
     results = body.get("results")
-    if isinstance(results, list):
-        embeddings = []
-        for item in results:
-            if isinstance(item, dict) and isinstance(item.get("embedding"), list):
-                embeddings.append(item["embedding"])
-        if embeddings:
-            return embeddings
+    embeddings = parse_items(results)
+    if embeddings:
+        return embeddings
     raise RuntimeError("AI gateway embedding response missing embeddings")
 
 
 def call_gateway_embeddings(config, texts, timeout):
+    texts = [str(text or "") for text in texts]
+    if uses_dashscope_multimodal_embedding(config.gateway_embedding_model):
+        all_embeddings = []
+        url = dashscope_service_url(
+            config.gateway_embedding_url,
+            "services/embeddings/multimodal-embedding/multimodal-embedding",
+        )
+        for start in range(0, len(texts), 20):
+            batch = texts[start : start + 20]
+            payload = {
+                "model": config.gateway_embedding_model,
+                "input": {"contents": [{"text": text} for text in batch]},
+            }
+            body = call_json_post(url, config.gateway_embedding_api_key, payload, timeout)
+            embeddings = embeddings_from_response(body)
+            if len(embeddings) != len(batch):
+                raise RuntimeError(
+                    f"AI gateway embedding count mismatch: expected {len(batch)}, got {len(embeddings)}"
+                )
+            all_embeddings.extend(embeddings)
+        return all_embeddings
+
     payload = {
         "model": config.gateway_embedding_model,
         "input": texts,
     }
-    body = call_json_post(openai_endpoint_url(config.gateway_embedding_url, "embeddings"), config.gateway_embedding_api_key, payload, timeout)
+    body = call_json_post(
+        openai_endpoint_url(config.gateway_embedding_url, "embeddings"),
+        config.gateway_embedding_api_key,
+        payload,
+        timeout,
+    )
     return embeddings_from_response(body)
 
 
@@ -572,7 +649,11 @@ def cosine_similarity(left, right):
 
 
 def rerank_results_from_response(body):
-    results = body.get("results") or body.get("data") or body.get("rankings") or []
+    output = body.get("output")
+    if isinstance(output, dict) and isinstance(output.get("results"), list):
+        results = output["results"]
+    else:
+        results = body.get("results") or body.get("data") or body.get("rankings") or []
     parsed = []
     if not isinstance(results, list):
         return parsed
@@ -595,6 +676,26 @@ def rerank_results_from_response(body):
 
 
 def call_gateway_rerank(config, query, documents, timeout, top_n):
+    if uses_dashscope_service_rerank(config.gateway_rerank_model):
+        payload = {
+            "model": config.gateway_rerank_model,
+            "input": {
+                "query": query,
+                "documents": [str(document or "") for document in documents],
+            },
+            "parameters": {
+                "top_n": top_n,
+                "return_documents": False,
+            },
+        }
+        body = call_json_post(
+            dashscope_service_url(config.gateway_rerank_url, "services/rerank/text-rerank/text-rerank"),
+            config.gateway_rerank_api_key,
+            payload,
+            timeout,
+        )
+        return rerank_results_from_response(body)
+
     payload = {
         "model": config.gateway_rerank_model,
         "query": query,
