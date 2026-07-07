@@ -922,7 +922,8 @@ def gateway_ranking_reason_prompt(inputs):
                 "12. 正常情况下，reason_body 必须原样引用 evidence_keywords 中至少 1-2 个关键词或数字，"
                 "例如 Teva、65亿、13.28%、SMO、CRF。"
                 "13. 如果 evidence_keywords 为空，只能引用 achievement 中明确出现的事实，不得补充外部想象。"
-                "14. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
+                "14. 禁止使用省略号或未完成句，包括 ...、…、等等、等内容。每句话必须自然结束。"
+                "15. 输出必须是严格 JSON，不要 Markdown，不要代码块。"
             ),
         },
         {
@@ -1795,18 +1796,13 @@ def match_level(score):
 def build_ranking_reason(entry):
     score_detail = entry.get("score_detail", {})
     dimensions = score_detail.get("dimensions", {})
-    strong_or_medium = []
     weak_or_missing = []
     for key, label in DIMENSION_LABELS.items():
-        grade = (dimensions.get(key, {}) or {}).get("grade", "missing")
-        reason = (dimensions.get(key, {}) or {}).get("reason", "")
-        if grade in {"strong", "medium"}:
-            strong_or_medium.append(label)
-        elif reason:
+        item = dimensions.get(key, {}) or {}
+        if item.get("grade") in {"weak", "missing"} and item.get("reason"):
             weak_or_missing.append(label)
-
-    points = ranking_reason_evidence_points(entry, 2)
     score_for_reason = entry.get("normal_review_score", entry.get("internal_score", 0)) or 0
+    points = ranking_reason_evidence_points(entry, 2)
     if not dimensions and points and entry.get("workflow_status") == "dry_run":
         score_sentence = "当前为预览模式，未调用评审模型计算综合匹配度。"
     elif not dimensions and points and score_for_reason <= 0:
@@ -1814,14 +1810,10 @@ def build_ranking_reason(entry):
     else:
         score_sentence = f"综合匹配度{match_level(score_for_reason)}。"
 
-    parts = [
-        f"本奖项排名第{entry.get('award_rank', '')}位。{score_sentence}"
-    ]
-    dimension_points = dimension_reason_points(entry, text_limit=36)
+    parts = [f"本奖项排名第{entry.get('award_rank', '')}位。{score_sentence}"]
+    dimension_points = dimension_reason_points(entry, text_limit=150)
     if dimension_points:
-        parts.append(ensure_sentence(f"分维度看，{'；'.join(dimension_points)}"))
-    elif strong_or_medium:
-        parts.append(f"主要支撑来自{('、').join(strong_or_medium[:3])}。")
+        parts.extend(ensure_sentence(point) for point in dimension_points)
     elif not points:
         parts.append("申报材料暂未形成足够的可评分证据。")
     if points:
@@ -1837,11 +1829,11 @@ def build_ranking_reason(entry):
         and not re.search(r"时间|未来|当前为20\d{2}|成立", to_plain_text(item))
     ]
     if stable_missing:
-        missing_text = truncate_text(stable_missing[0], 80)
+        missing_text = limit_text_without_ellipsis(stable_missing[0], 120)
         parts.append(ensure_sentence(f"需补充/复核：{missing_text}"))
     if entry.get("recommendation_status") == "needs_review":
         parts.append("因此需人工复核后再确认最终意见。")
-    return truncate_text("".join(parts), 480)
+    return limit_ranking_reason_text("".join(parts))
 
 
 def truncate_text(value, limit=260):
@@ -1849,6 +1841,44 @@ def truncate_text(value, limit=260):
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
+
+
+def has_truncation_marker(value):
+    return "..." in str(value or "") or "…" in str(value or "")
+
+
+def strip_truncation_markers(value):
+    return str(value or "").replace("...", "").replace("…", "").strip()
+
+
+def limit_text_without_ellipsis(value, limit=260):
+    text = re.sub(r"\s+", " ", strip_truncation_markers(to_plain_text(value))).strip()
+    if len(text) <= limit:
+        return text
+    boundary = -1
+    for char in "。！？；;，,、 ":
+        index = text.rfind(char, 0, limit)
+        if index > boundary:
+            boundary = index
+    if boundary >= max(24, int(limit * 0.45)):
+        text = text[:boundary].rstrip("，,；;、 ")
+    else:
+        text = text[:limit].rstrip("，,；;、 ")
+    return ensure_sentence(text)
+
+
+def limit_ranking_reason_text(value, limit=1200):
+    text = re.sub(r"\s+", " ", strip_truncation_markers(to_plain_text(value))).strip()
+    if len(text) <= limit:
+        return text
+    boundary = -1
+    for char in "。！？；;":
+        index = text.rfind(char, 0, limit)
+        if index > boundary:
+            boundary = index
+    if boundary >= max(80, int(limit * 0.6)):
+        return text[: boundary + 1].strip()
+    return ensure_sentence(text[:limit].rstrip("，,；;、 "))
 
 
 def ensure_sentence(text):
@@ -1980,8 +2010,8 @@ def normalize_ranking_reason(reason, rank):
     text = re.sub(r"位居当前名次[，。；;]?", "", text).strip()
     prefix = f"本奖项排名第{rank}位。"
     if text.startswith(prefix):
-        return truncate_text(text, 480)
-    return truncate_text(prefix + text, 480)
+        return limit_ranking_reason_text(text)
+    return limit_ranking_reason_text(prefix + text)
 
 
 def ranking_reason_body(reason_json):
@@ -2018,7 +2048,7 @@ def compose_dimension_reason_body(reason_json):
             item.get("gap"),
         ))
         if reason:
-            points.append(f"{label}{grade_label}：{truncate_text(reason, 70)}")
+            points.append(f"{label}{grade_label}：{limit_text_without_ellipsis(reason, 110)}")
     overall = to_plain_text(first_non_empty(
         reason_json.get("overall_reason"),
         reason_json.get("summary"),
@@ -2052,11 +2082,11 @@ def dimension_details(entry, text_limit=140):
             "label": label,
             "grade": grade,
             "grade_label": GRADE_LABELS.get(grade, grade),
-            "why": truncate_text(to_plain_text(item.get("why") or item.get("reason", "")), text_limit),
-            "reason": truncate_text(to_plain_text(item.get("reason", "")), text_limit),
-            "evidence": truncate_text(to_plain_text(item.get("evidence", "")), text_limit),
-            "gap": truncate_text(to_plain_text(item.get("gap", "")), text_limit),
-            "rule_basis": truncate_text(to_plain_text(item.get("rule_basis", "")), text_limit),
+            "why": limit_text_without_ellipsis(item.get("why") or item.get("reason", ""), text_limit),
+            "reason": limit_text_without_ellipsis(item.get("reason", ""), text_limit),
+            "evidence": limit_text_without_ellipsis(item.get("evidence", ""), text_limit),
+            "gap": limit_text_without_ellipsis(item.get("gap", ""), text_limit),
+            "rule_basis": limit_text_without_ellipsis(item.get("rule_basis", ""), text_limit),
         }
     return details
 
@@ -2091,7 +2121,7 @@ def key_strengths(entry, limit=3):
         item = dimensions.get(key, {}) or {}
         if item.get("grade") in {"strong", "medium"}:
             evidence = to_plain_text(item.get("evidence") or item.get("reason") or label)
-            strengths.append(f"{label}: {truncate_text(evidence, 80)}")
+            strengths.append(f"{label}: {limit_text_without_ellipsis(evidence, 110)}")
     return strengths[:limit]
 
 
@@ -2102,13 +2132,13 @@ def key_gaps(entry, limit=2):
         if not is_award_type_confirmation_gap(item)
     ]
     if gaps:
-        return [truncate_text(to_plain_text(item), 90) for item in gaps[:limit]]
+        return [limit_text_without_ellipsis(item, 120) for item in gaps[:limit]]
     dimensions = entry.get("score_detail", {}).get("dimensions", {})
     for key, label in DIMENSION_LABELS.items():
         item = dimensions.get(key, {}) or {}
         if item.get("grade") in {"weak", "missing"} and item.get("reason"):
             gaps.append(f"{label}: {item.get('reason')}")
-    return [truncate_text(item, 90) for item in gaps[:limit]]
+    return [limit_text_without_ellipsis(item, 120) for item in gaps[:limit]]
 
 
 def unique_text_items(items, limit, text_limit=120):
@@ -2118,7 +2148,7 @@ def unique_text_items(items, limit, text_limit=120):
         text = re.sub(r"\s+", " ", to_plain_text(item)).strip(" -:：，,；;")
         if not text:
             continue
-        text = truncate_text(text, text_limit)
+        text = limit_text_without_ellipsis(text, text_limit)
         if text in seen:
             continue
         seen.add(text)
@@ -2207,7 +2237,7 @@ def build_candidate_summary(entry):
         "submitter": fields.get("提报人", ""),
         "team_leader": fields.get("团队负责人", ""),
         "team_members": fields.get("团队成员", ""),
-        "achievement": truncate_text(summary_achievement(entry), 700),
+        "achievement": limit_text_without_ellipsis(summary_achievement(entry), 700),
         "match_level": match_level(internal_score),
         "score": internal_score,
         "internal_score": internal_score,
@@ -2259,7 +2289,7 @@ def build_review_rule_summary(award_entries):
     rules = []
     for entry in award_entries:
         for rule in entry.get("review_json", {}).get("matched_rules", []) or []:
-            text = truncate_text(rule, 180)
+            text = limit_text_without_ellipsis(rule, 220)
             if text and text not in rules:
                 rules.append(text)
     if rules:
@@ -2288,13 +2318,15 @@ def add_leadership_priority_context(reason, entry):
     note = priority.get("priority_note") or f"结合{priority.get('source_label', '内部')}战略优先级。"
     if not text or note in text:
         return text
-    return truncate_text(text + note, 520)
+    return limit_ranking_reason_text(text + note)
 
 
 def is_low_quality_ranking_reason(reason_body, entry):
     text = str(reason_body or "")
     if not text:
         return False
+    if has_truncation_marker(text):
+        return True
     markers = (
         "当前正文证据不足",
         "证据不足",
@@ -2348,7 +2380,7 @@ def generate_ranking_reasons(entries, config, timeout, dry_run=False):
                 reason = normalize_ranking_reason(reason_body, entry.get("award_rank", ""))
                 entry["ranking_reason_body"] = reason_body
                 entry["ranking_reason_json"] = reason_json
-                if reason and is_low_quality_ranking_reason(reason_body, entry):
+                if reason and (is_low_quality_ranking_reason(reason_body, entry) or has_truncation_marker(reason)):
                     entry["ranking_reason"] = fallback
                     entry["ranking_reason_source"] = "local_quality_repair"
                 else:
@@ -2785,6 +2817,7 @@ def run_quality_checks(xlsx_path, internal_pack_path, expected_rows, require_mod
     prefix_errors = []
     rank_one_bad = []
     global_bad = []
+    truncation_bad = []
     award_type_confirmation_bad = []
     for group in groups:
         group_rows = group["rows"]
@@ -2823,6 +2856,11 @@ def run_quality_checks(xlsx_path, internal_pack_path, expected_rows, require_mod
                     "markers": matched_global,
                     "reason_preview": reason[:220],
                 })
+            if has_truncation_marker(reason):
+                truncation_bad.append({
+                    "row": row["row_idx"],
+                    "reason_preview": reason[:220],
+                })
             confirmation_sentences = [
                 sentence
                 for sentence in re.findall(r"[^。！？；;]+[。！？；;]?", reason)
@@ -2850,6 +2888,9 @@ def run_quality_checks(xlsx_path, internal_pack_path, expected_rows, require_mod
         "errors": rank_one_bad,
     })
     add_qa_check(report, "global_broken_phrases", not global_bad, "排名理由不含残句", {"errors": global_bad})
+    add_qa_check(report, "ranking_reason_no_truncation_markers", not truncation_bad, "排名理由不含省略号或截断痕迹", {
+        "errors": truncation_bad,
+    })
     add_qa_check(
         report,
         "award_type_confirmation_phrases",
