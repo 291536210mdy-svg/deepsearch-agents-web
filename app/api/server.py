@@ -7,6 +7,7 @@ WebSocket 长连接。HTTP 接口只做轻量调度，真正的 DeepAgents 执�
 """
 
 import asyncio
+import datetime
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -51,8 +52,10 @@ project_root = current_dir.parent
 
 app = FastAPI(title="DeepAgents API", lifespan=lifespan)
 
-# 保存 thread_id -> 后台 Agent 任务，用于同一会话任务替换和主动取消
+# 保存 run_id -> 后台 Agent 任务；thread_id 只代表历史会话，run_id 才代表一次执行
 active_tasks: dict[str, asyncio.Task] = {}
+active_run_threads: dict[str, str] = {}
+active_runs_by_thread: dict[str, str] = {}
 
 # output 保存每个会话最终工作区，前端只允许从这里浏览和下载生成文件
 output_dir = project_root / "output"
@@ -98,6 +101,7 @@ class ChatUpdateRequest(BaseModel):
 class ChatMessageRequest(BaseModel):
     role: str
     content: str | None = None
+    run_id: str | None = None
     event_type: str | None = None
     event_json: dict | None = None
     files_json: list | dict | None = None
@@ -108,6 +112,10 @@ async def run_history_call(func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"聊天历史数据库不可用：{exc}") from exc
+
+
+async def run_history_background(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 @app.get("/api/chats")
@@ -179,6 +187,7 @@ async def create_chat_message(thread_id: str, request: ChatMessageRequest):
         thread_id,
         request.role,
         request.content,
+        run_id=request.run_id,
         event_type=request.event_type,
         event_json=request.event_json,
         files_json=request.files_json,
@@ -186,15 +195,138 @@ async def create_chat_message(thread_id: str, request: ChatMessageRequest):
     return {"message": message}
 
 
-def _forget_task(thread_id: str, task: asyncio.Task) -> None:
+@app.get("/api/chats/{thread_id}/runs")
+async def list_chat_runs(thread_id: str, limit: int = 20):
+    thread = await run_history_call(chat_history.get_thread, thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    runs = await run_history_call(chat_history.list_runs, thread_id, limit=limit)
+    return {"runs": runs}
+
+
+@app.get("/api/chats/{thread_id}/runs/active")
+async def get_active_chat_run(thread_id: str):
+    thread = await run_history_call(chat_history.get_thread, thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="聊天不存在")
+    run = await run_history_call(chat_history.get_active_run, thread_id)
+    return {"run": run}
+
+
+def _forget_task(run_id: str, task: asyncio.Task) -> None:
     """
     清理已结束任务的登记关系。
 
     done_callback 触发时，active_tasks 中可能已经被新任务替换；只有仍是同一个
-    task 时才删除，避免误清理同 thread_id 下刚启动的新任务。
+    task 时才删除，避免误清理刚启动的新 run。
     """
-    if active_tasks.get(thread_id) is task:
-        active_tasks.pop(thread_id, None)
+    if active_tasks.get(run_id) is task:
+        active_tasks.pop(run_id, None)
+    thread_id = active_run_threads.pop(run_id, None)
+    if thread_id and active_runs_by_thread.get(thread_id) == run_id:
+        active_runs_by_thread.pop(thread_id, None)
+
+
+async def _run_agent_task(thread_id: str, run_id: str, clean_query: str) -> None:
+    try:
+        await run_history_background(chat_history.update_run_status, run_id, "running")
+        history_messages = await run_history_background(
+            chat_history.list_agent_context_messages,
+            thread_id,
+            current_run_id=run_id,
+        )
+        result = await run_deep_agent(
+            clean_query,
+            thread_id,
+            run_id=run_id,
+            history_messages=history_messages,
+        )
+        run = await run_history_background(chat_history.get_run, run_id)
+        if run and run.get("status") == "interrupted":
+            return
+        if result:
+            await run_history_background(
+                chat_history.append_message,
+                thread_id,
+                "assistant",
+                result,
+                run_id=run_id,
+                event_type="task_result",
+            )
+        await run_history_background(chat_history.update_run_status, run_id, "success")
+    except asyncio.CancelledError:
+        await run_history_background(
+            chat_history.update_run_status,
+            run_id,
+            "interrupted",
+            error="Cancelled by user",
+        )
+        raise
+    except Exception as exc:
+        await run_history_background(
+            chat_history.update_run_status,
+            run_id,
+            "error",
+            error=str(exc),
+        )
+        await manager.send_to_thread(
+            {
+                "type": "monitor_event",
+                "event": "error",
+                "message": f"任务执行失败：{str(exc)}",
+                "data": {"run_id": run_id},
+                "run_id": run_id,
+                "timestamp": datetime.datetime.now().isoformat(),
+            },
+            thread_id,
+        )
+
+
+async def _cancel_run(thread_id: str, run_id: str) -> dict:
+    run = await run_history_call(chat_history.get_run, run_id)
+    if not run or run["thread_id"] != thread_id:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task = active_tasks.get(run_id)
+    task_active = bool(task and not task.done())
+    if run["status"] == "interrupted":
+        return {"status": "cancelled", "thread_id": thread_id, "run_id": run_id}
+    if not task_active and run["status"] not in chat_history.RUN_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"任务已结束，当前状态：{run['status']}")
+
+    await run_history_call(
+        chat_history.update_run_status,
+        run_id,
+        "interrupted",
+        error="Cancelled by user",
+    )
+    await run_history_call(
+        chat_history.append_message,
+        thread_id,
+        "assistant",
+        "任务已取消",
+        run_id=run_id,
+        event_type="task_cancelled",
+    )
+
+    if not task_active:
+        _forget_task(run_id, task) if task else None
+        return {"status": "cancelled", "thread_id": thread_id, "run_id": run_id}
+
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=1.0)
+    except asyncio.CancelledError:
+        _forget_task(run_id, task)
+        return {"status": "cancelled", "thread_id": thread_id, "run_id": run_id}
+    except asyncio.TimeoutError:
+        return {"status": "cancelling", "thread_id": thread_id, "run_id": run_id}
+    except Exception as e:
+        _forget_task(run_id, task)
+        return {"status": "cancelled", "thread_id": thread_id, "run_id": run_id, "message": str(e)}
+
+    _forget_task(run_id, task)
+    return {"status": "cancelled", "thread_id": thread_id, "run_id": run_id}
 
 
 @app.post("/api/task")
@@ -217,19 +349,48 @@ async def run_task(request: TaskRequest):
         title=chat_history.thread_title_from_query(clean_query),
         session_path=session_path,
     )
-    await run_history_call(chat_history.append_message, thread_id, "user", clean_query)
 
-    # 同一个 thread_id 只保留一个活跃任务，新任务会先取消旧任务，避免并发写同一会话目录
-    old_task = active_tasks.get(thread_id)
-    if old_task and not old_task.done():
-        old_task.cancel()
+    existing_run_id = active_runs_by_thread.get(thread_id)
+    if not existing_run_id:
+        active_run = await run_history_call(chat_history.get_active_run, thread_id)
+        existing_run_id = active_run["id"] if active_run else None
+    if existing_run_id:
+        try:
+            await _cancel_run(thread_id, existing_run_id)
+        except HTTPException as exc:
+            if exc.status_code not in {404, 409}:
+                raise
+
+    run_id = str(uuid.uuid4())
+    checkpoint_id = f"{thread_id}:{run_id}"
+    await run_history_call(
+        chat_history.create_run,
+        thread_id,
+        clean_query,
+        run_id=run_id,
+        checkpoint_id=checkpoint_id,
+    )
+    await run_history_call(
+        chat_history.append_message,
+        thread_id,
+        "user",
+        clean_query,
+        run_id=run_id,
+    )
 
     # create_task 把长耗时 Agent 执行交给事件循环，接口本身不用等待最终结果
-    task = asyncio.create_task(run_deep_agent(clean_query, thread_id))
-    active_tasks[thread_id] = task
-    task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
+    task = asyncio.create_task(_run_agent_task(thread_id, run_id, clean_query))
+    active_tasks[run_id] = task
+    active_run_threads[run_id] = thread_id
+    active_runs_by_thread[thread_id] = run_id
+    task.add_done_callback(lambda finished_task: _forget_task(run_id, finished_task))
 
-    return {"status": "started", "thread_id": thread_id}
+    return {"status": "started", "thread_id": thread_id, "run_id": run_id}
+
+
+@app.post("/api/chats/{thread_id}/runs/{run_id}/cancel")
+async def cancel_chat_run(thread_id: str, run_id: str):
+    return await _cancel_run(thread_id, run_id)
 
 
 @app.post("/api/task/{thread_id}/cancel")
@@ -240,26 +401,13 @@ async def cancel_task(thread_id: str):
     注意：取消会向 asyncio.Task 注入 CancelledError。若底层第三方工具正在执行不可中断
     的同步阻塞调用，任务可能需要等该调用返回后才会真正结束。
     """
-    task = active_tasks.get(thread_id)
-    if not task or task.done():
-        active_tasks.pop(thread_id, None)
+    run_id = active_runs_by_thread.get(thread_id)
+    if not run_id:
+        active_run = await run_history_call(chat_history.get_active_run, thread_id)
+        run_id = active_run["id"] if active_run else None
+    if not run_id:
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
-
-    # 先发出取消信号，再短暂等待协程响应；若底层阻塞中，则返回 cancelling 给前端继续展示状态
-    task.cancel()
-    try:
-        await asyncio.wait_for(task, timeout=1.0)
-    except asyncio.CancelledError:
-        _forget_task(thread_id, task)
-        return {"status": "cancelled", "thread_id": thread_id}
-    except asyncio.TimeoutError:
-        return {"status": "cancelling", "thread_id": thread_id}
-    except Exception as e:
-        _forget_task(thread_id, task)
-        return {"status": "cancelled", "thread_id": thread_id, "message": str(e)}
-
-    _forget_task(thread_id, task)
-    return {"status": "cancelled", "thread_id": thread_id}
+    return await _cancel_run(thread_id, run_id)
 
 
 @app.post("/api/upload")

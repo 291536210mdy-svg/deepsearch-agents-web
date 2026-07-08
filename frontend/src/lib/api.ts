@@ -1,5 +1,6 @@
 import { API_BASE_URL } from "./config";
 import type {
+  ActiveRunResponse,
   CancelTaskResponse,
   ChatListResponse,
   ChatMessagesResponse,
@@ -80,6 +81,21 @@ export async function cancelTask(threadId: string): Promise<CancelTaskResponse> 
   return requestJson<CancelTaskResponse>(apiUrl(`/api/task/${encodeURIComponent(threadId)}/cancel`), {
     method: "POST"
   });
+}
+
+export async function cancelRun(threadId: string, runId: string): Promise<CancelTaskResponse> {
+  return requestJson<CancelTaskResponse>(
+    apiUrl(`/api/chats/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel`),
+    {
+      method: "POST"
+    }
+  );
+}
+
+export async function getActiveRun(threadId: string): Promise<ActiveRunResponse> {
+  return requestJson<ActiveRunResponse>(
+    apiUrl(`/api/chats/${encodeURIComponent(threadId)}/runs/active`)
+  );
 }
 
 export async function uploadSessionFiles(

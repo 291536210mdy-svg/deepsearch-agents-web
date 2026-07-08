@@ -12,6 +12,8 @@ load_dotenv(find_dotenv())
 
 DEFAULT_USER_ID = "default"
 THREAD_TITLE_LIMIT = 60
+RUN_ACTIVE_STATUSES = {"pending", "running"}
+RUN_TERMINAL_STATUSES = {"success", "error", "timeout", "interrupted"}
 _schema_ready = False
 
 
@@ -66,6 +68,7 @@ def ensure_schema() -> None:
                 CREATE TABLE IF NOT EXISTS chat_messages (
                   id BIGINT AUTO_INCREMENT PRIMARY KEY,
                   thread_id VARCHAR(64) NOT NULL,
+                  run_id VARCHAR(64) NULL,
                   role ENUM('user', 'assistant', 'system', 'tool', 'event') NOT NULL,
                   content LONGTEXT NULL,
                   event_type VARCHAR(64) NULL,
@@ -73,12 +76,44 @@ def ensure_schema() -> None:
                   files_json JSON NULL,
                   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                   INDEX idx_chat_messages_thread_created (thread_id, created_at, id),
+                  INDEX idx_chat_messages_run_created (run_id, created_at, id),
                   CONSTRAINT fk_chat_messages_thread
                     FOREIGN KEY (thread_id) REFERENCES chat_threads(id)
                     ON DELETE CASCADE
                 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_runs (
+                  id VARCHAR(64) PRIMARY KEY,
+                  thread_id VARCHAR(64) NOT NULL,
+                  user_id VARCHAR(64) NOT NULL DEFAULT 'default',
+                  status ENUM('pending', 'running', 'success', 'error', 'timeout', 'interrupted')
+                    NOT NULL DEFAULT 'pending',
+                  query LONGTEXT NULL,
+                  checkpoint_id VARCHAR(160) NULL,
+                  error TEXT NULL,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  started_at DATETIME NULL,
+                  finished_at DATETIME NULL,
+                  cancel_requested_at DATETIME NULL,
+                  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  metadata JSON NULL,
+                  INDEX idx_chat_runs_thread_status (thread_id, status, updated_at, id),
+                  INDEX idx_chat_runs_user_updated (user_id, updated_at, id),
+                  CONSTRAINT fk_chat_runs_thread
+                    FOREIGN KEY (thread_id) REFERENCES chat_threads(id)
+                    ON DELETE CASCADE
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                """
+            )
+            cursor.execute("SHOW COLUMNS FROM chat_messages LIKE 'run_id'")
+            if cursor.fetchone() is None:
+                cursor.execute("ALTER TABLE chat_messages ADD COLUMN run_id VARCHAR(64) NULL AFTER thread_id")
+                cursor.execute(
+                    "ALTER TABLE chat_messages ADD INDEX idx_chat_messages_run_created (run_id, created_at, id)"
+                )
     _schema_ready = True
 
 
@@ -130,12 +165,31 @@ def row_to_message(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
         "thread_id": row["thread_id"],
+        "run_id": row.get("run_id") or "",
         "role": row["role"],
         "content": row.get("content") or "",
         "event_type": row.get("event_type") or "",
         "event_json": json_loads(row.get("event_json")),
         "files_json": json_loads(row.get("files_json")),
         "created_at": iso_datetime(row.get("created_at")),
+    }
+
+
+def row_to_run(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "thread_id": row["thread_id"],
+        "user_id": row.get("user_id") or DEFAULT_USER_ID,
+        "status": row.get("status") or "pending",
+        "query": row.get("query") or "",
+        "checkpoint_id": row.get("checkpoint_id") or "",
+        "error": row.get("error") or "",
+        "created_at": iso_datetime(row.get("created_at")),
+        "started_at": iso_datetime(row.get("started_at")),
+        "finished_at": iso_datetime(row.get("finished_at")),
+        "cancel_requested_at": iso_datetime(row.get("cancel_requested_at")),
+        "updated_at": iso_datetime(row.get("updated_at")),
+        "metadata": json_loads(row.get("metadata")) or {},
     }
 
 
@@ -293,6 +347,7 @@ def append_message(
     role: str,
     content: str | None = None,
     *,
+    run_id: str | None = None,
     event_type: str | None = None,
     event_json: dict[str, Any] | None = None,
     files_json: Any = None,
@@ -303,11 +358,12 @@ def append_message(
             cursor.execute(
                 """
                 INSERT INTO chat_messages
-                  (thread_id, role, content, event_type, event_json, files_json)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                  (thread_id, run_id, role, content, event_type, event_json, files_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     thread_id,
+                    run_id,
                     role,
                     content,
                     event_type,
@@ -343,3 +399,151 @@ def list_messages(thread_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
                 (thread_id, limit),
             )
             return [row_to_message(row) for row in cursor.fetchall()]
+
+
+def create_run(
+    thread_id: str,
+    query: str,
+    *,
+    run_id: str | None = None,
+    checkpoint_id: str | None = None,
+    user_id: str = DEFAULT_USER_ID,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_schema()
+    run_id = run_id or str(uuid.uuid4())
+    with db_connect() as conn:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                INSERT INTO chat_runs
+                  (id, thread_id, user_id, status, query, checkpoint_id, metadata)
+                VALUES (%s, %s, %s, 'pending', %s, %s, %s)
+                """,
+                (
+                    run_id,
+                    thread_id,
+                    user_id,
+                    query,
+                    checkpoint_id,
+                    json_dumps(metadata or {}),
+                ),
+            )
+            cursor.execute("SELECT * FROM chat_runs WHERE id = %s", (run_id,))
+            return row_to_run(cursor.fetchone())
+
+
+def get_run(run_id: str) -> dict[str, Any] | None:
+    ensure_schema()
+    with db_connect() as conn:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT * FROM chat_runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+    return row_to_run(row) if row else None
+
+
+def get_active_run(thread_id: str) -> dict[str, Any] | None:
+    ensure_schema()
+    with db_connect() as conn:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM chat_runs
+                WHERE thread_id = %s AND status IN ('pending', 'running')
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (thread_id,),
+            )
+            row = cursor.fetchone()
+    return row_to_run(row) if row else None
+
+
+def list_runs(thread_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    ensure_schema()
+    limit = max(1, min(int(limit or 20), 100))
+    with db_connect() as conn:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM chat_runs
+                WHERE thread_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (thread_id, limit),
+            )
+            return [row_to_run(row) for row in cursor.fetchall()]
+
+
+def update_run_status(
+    run_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    ensure_schema()
+    updates = ["status = %s", "updated_at = CURRENT_TIMESTAMP"]
+    params: list[Any] = [status]
+
+    if status == "running":
+        updates.append("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)")
+    if status in RUN_TERMINAL_STATUSES:
+        updates.append("finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)")
+    if status == "interrupted":
+        updates.append("cancel_requested_at = COALESCE(cancel_requested_at, CURRENT_TIMESTAMP)")
+    if error is not None:
+        updates.append("error = %s")
+        params.append(error)
+
+    params.append(run_id)
+    with db_connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE chat_runs SET {', '.join(updates)} WHERE id = %s",
+                tuple(params),
+            )
+    return get_run(run_id)
+
+
+def list_agent_context_messages(
+    thread_id: str,
+    *,
+    current_run_id: str,
+    limit: int = 40,
+) -> list[dict[str, str]]:
+    """
+    给模型恢复上下文时，只放历史成功 run 的用户/助手消息，以及当前 run 的用户消息。
+    已 interrupted/error 的旧 run 不进入模型上下文，避免取消任务被下一句输入唤醒。
+    """
+    ensure_schema()
+    limit = max(1, min(int(limit or 40), 100))
+    with db_connect() as conn:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                SELECT m.*
+                FROM chat_messages m
+                LEFT JOIN chat_runs r ON m.run_id = r.id
+                WHERE m.thread_id = %s
+                  AND m.role IN ('user', 'assistant')
+                  AND (
+                    m.run_id IS NULL
+                    OR m.run_id = %s
+                    OR r.status = 'success'
+                  )
+                ORDER BY m.created_at DESC, m.id DESC
+                LIMIT %s
+                """,
+                (thread_id, current_run_id, limit),
+            )
+            rows = list(reversed(cursor.fetchall()))
+
+    return [
+        {
+            "role": row["role"],
+            "content": row.get("content") or "",
+        }
+        for row in rows
+        if row.get("content")
+    ]

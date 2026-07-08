@@ -13,7 +13,8 @@ from typing import Annotated
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.tools import tool
 
-from app.api.context import get_session_context
+from app.api import chat_history
+from app.api.context import get_run_context, get_session_context
 from app.api.monitor import monitor
 from app.award_review import review_batch as rb
 from app.utils.path_utils import resolve_path
@@ -130,6 +131,17 @@ class AwardReviewEventSink:
         )
 
 
+def _current_run_cancelled() -> bool:
+    run_id = get_run_context()
+    if not run_id:
+        return False
+    try:
+        run = chat_history.get_run(run_id)
+    except Exception:
+        return False
+    return bool(run and run.get("status") == "interrupted")
+
+
 def _gateway_preflight(config: rb.ReviewBatchConfig) -> None:
     if (config.model_backend or "gateway").strip().lower() != "gateway" or config.dry_run:
         return
@@ -227,7 +239,11 @@ def run_award_review(
             {"tool_name": "AI评优批处理工具", "event_type": "gateway:preflight_done"},
         )
 
-        result = rb.run_review_batch(config, event_sink=AwardReviewEventSink())
+        result = rb.run_review_batch(
+            config,
+            event_sink=AwardReviewEventSink(),
+            should_cancel=_current_run_cancelled,
+        )
 
         artifacts = {
             "review_results_xlsx": _artifact_info(Path(result.xlsx_path), session_path),

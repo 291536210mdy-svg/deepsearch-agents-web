@@ -15,6 +15,7 @@ export interface MonitorMessage {
   message: string;
   data: Record<string, unknown>;
   timestamp: string;
+  run_id?: string;
 }
 
 export interface PongMessage {
@@ -27,11 +28,13 @@ export type SocketMessage = MonitorMessage | PongMessage;
 export interface TaskResponse {
   status: "started" | string;
   thread_id: string;
+  run_id: string;
 }
 
 export interface CancelTaskResponse {
   status: "cancelled" | "cancelling" | string;
   thread_id: string;
+  run_id?: string;
   message?: string;
 }
 
@@ -68,12 +71,33 @@ export interface ChatThreadRecord {
 export interface ChatMessageRecord {
   id: number;
   thread_id: string;
+  run_id: string;
   role: "user" | "assistant" | "system" | "tool" | "event" | string;
   content: string;
   event_type: string;
   event_json: Record<string, unknown> | null;
   files_json: unknown;
   created_at: string;
+}
+
+export interface ChatRunRecord {
+  id: string;
+  thread_id: string;
+  user_id: string;
+  status: "pending" | "running" | "success" | "error" | "timeout" | "interrupted" | string;
+  query: string;
+  checkpoint_id: string;
+  error: string;
+  created_at: string;
+  started_at: string;
+  finished_at: string;
+  cancel_requested_at: string;
+  updated_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface ActiveRunResponse {
+  run: ChatRunRecord | null;
 }
 
 export interface ChatListResponse {

@@ -21,6 +21,7 @@ from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
 from app.agent.subagents.network_search_agent import network_search_agent
 from app.api.context import (
     reset_session_context,
+    set_run_context,
     set_session_context,
     set_thread_context,
 )
@@ -34,7 +35,7 @@ from app.tools.upload_file_read_tool import read_file_content
 # 主智能体是调度中心：
 # 1. tools 只放最终交付相关的文件工具
 # 2. subagents 放评优、网络、数据库、RAGFlow 四类专家助手
-# 3. checkpointer 通过 thread_id 保存同一会话中的执行上下文
+# 3. checkpointer 通过 thread_id 保存同一执行中的上下文；Web 服务会传入 thread_id:run_id 隔离单次执行
 main_agent = create_deep_agent(
     model=model,
     system_prompt=main_agent_content["system_prompt"],
@@ -52,16 +53,19 @@ main_agent = create_deep_agent(
 project_root_path = Path(__file__).parents[1].resolve()
 
 
-async def run_deep_agent(task_query, session_id):
+async def run_deep_agent(task_query, session_id, run_id: str | None = None, history_messages: list[dict] | None = None):
     """
     异步流式执行主智能体
 
     API 层会为每次任务传入用户问题和 session_id。本函数负责准备会话目录、
     复制上传文件、写入 ContextVar，并在流式执行过程中把关键事件上报给前端。
     :param task_query: 前端提交的原始任务问题
-    :param session_id: 当前任务 ID，同时用于 thread_id、输出目录和 WebSocket 定向推送
+    :param session_id: 当前聊天会话 ID，用于输出目录和 WebSocket 定向推送
+    :param run_id: 当前用户消息触发的单次执行 ID，用于隔离 checkpoint 和监控事件
+    :param history_messages: 已过滤的历史消息，只应包含成功 run 和当前用户消息
     """
-    print(f"[MainAgent] 开始执行会话，session_id={session_id}")
+    run_id = run_id or session_id
+    print(f"[MainAgent] 开始执行会话，session_id={session_id}, run_id={run_id}")
 
     # 每个会话独立使用 output/session_{session_id}，避免不同用户的产物互相覆盖
     session_dir = project_root_path / "output" / f"session_{session_id}"
@@ -94,12 +98,14 @@ async def run_deep_agent(task_query, session_id):
     # ContextVar 让深层工具无需显式传参，也能拿到当前会话目录和 WebSocket thread_id
     session_dir_token = set_session_context(session_dir_str)
     session_id_token = set_thread_context(session_id)
+    run_id_token = set_run_context(run_id)
 
     # 前端拿到工作目录后，可以展示本次任务生成的 Markdown/PDF 等产物
     monitor.report_session_dir(session_dir_str)
 
-    # checkpointer 依赖 thread_id 区分会话记忆；同一 session_id 会复用同一条执行上下文
-    config = {"configurable": {"thread_id": session_id}}
+    # checkpointer 使用 thread_id:run_id 隔离单次执行，避免取消/半截任务被下一条用户消息唤醒
+    agent_checkpoint_id = f"{session_id}:{run_id}"
+    config = {"configurable": {"thread_id": agent_checkpoint_id}}
 
     # 工作环境指令是运行时动态补充的，约束模型只在当前会话目录读写文件
     path_instruction = f"""
@@ -114,10 +120,18 @@ async def run_deep_agent(task_query, session_id):
     4. 若存在上传文件，请先分析内容
     """
 
+    agent_messages = [dict(message) for message in history_messages] if history_messages else []
+    if agent_messages:
+        agent_messages[-1]["content"] = str(agent_messages[-1].get("content", "")) + path_instruction
+    else:
+        agent_messages = [{"role": "user", "content": task_query + path_instruction}]
+
+    final_result = ""
+
     try:
         # astream 会持续产出模型节点、工具节点和子智能体节点的状态片段
         async for chunk in main_agent.astream(
-            {"messages": [{"role": "user", "content": task_query + path_instruction}]},
+            {"messages": agent_messages},
             config=config,
         ):
             # chunk 形如 {"model": {"messages": [...]}}，这里主要关心模型最新消息
@@ -146,6 +160,7 @@ async def run_deep_agent(task_query, session_id):
                             print(
                                 f"主智能体执行结果，最终结果：{last_msg.content[:100]}"
                             )
+                            final_result = last_msg.content
                             monitor.report_task_result(last_msg.content)
 
     except asyncio.CancelledError:
@@ -154,9 +169,12 @@ async def run_deep_agent(task_query, session_id):
     except Exception as e:
         # 异步执行异常也走 monitor，保证前端能收到明确错误事件
         monitor._emit("error", f"执行主智能发生异常信息：{str(e)}")
+        raise
     finally:
         # 任务结束后恢复 ContextVar，避免后续请求复用到本次会话目录或 thread_id
-        reset_session_context(session_dir_token, session_id_token)
+        reset_session_context(session_dir_token, session_id_token, run_id_token)
+
+    return final_result
 
 
 if __name__ == "__main__":

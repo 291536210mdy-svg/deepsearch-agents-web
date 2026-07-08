@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelTask,
+  cancelRun,
   createChat,
+  getActiveRun,
   getChatMessages,
   listSessionFiles,
   startTask,
@@ -30,7 +32,10 @@ export function useDeepAgentSession() {
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
   const uploadedNameSetRef = useRef<Set<string>>(new Set());
+  const currentRunIdRef = useRef("");
+  const ignoredRunIdsRef = useRef<Set<string>>(new Set());
   const [threadId, setThreadId] = useState(getStoredThreadId);
+  const [currentRunId, setCurrentRunId] = useState("");
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [events, setEvents] = useState<MonitorMessage[]>([]);
   const [files, setFiles] = useState<OutputFile[]>([]);
@@ -62,8 +67,27 @@ export function useDeepAgentSession() {
     setLastError("");
     setUploadedItems([]);
     uploadedNameSetRef.current.clear();
+    currentRunIdRef.current = "";
+    setCurrentRunId("");
     setIsRunning(false);
     setIsCancelling(false);
+  }, []);
+
+  const syncActiveRun = useCallback(async (targetThreadId: string) => {
+    const response = await getActiveRun(targetThreadId);
+    const activeRun = response.run;
+    if (activeRun && (activeRun.status === "pending" || activeRun.status === "running")) {
+      currentRunIdRef.current = activeRun.id;
+      setCurrentRunId(activeRun.id);
+      setIsRunning(true);
+      setIsCancelling(false);
+      return activeRun;
+    }
+    currentRunIdRef.current = "";
+    setCurrentRunId("");
+    setIsRunning(false);
+    setIsCancelling(false);
+    return null;
   }, []);
 
   const resetSession = useCallback(async () => {
@@ -78,8 +102,9 @@ export function useDeepAgentSession() {
     const response = await getChatMessages(targetThreadId);
     setSessionPath(response.messages.length > 0 ? response.thread.session_path || "" : "");
     setLastError("");
+    await syncActiveRun(targetThreadId);
     return response.messages;
-  }, [threadId]);
+  }, [syncActiveRun, threadId]);
 
   const switchSession = useCallback(async (nextThreadId: string): Promise<ChatMessageRecord[]> => {
     const response = await getChatMessages(nextThreadId);
@@ -87,8 +112,9 @@ export function useDeepAgentSession() {
     setThreadId(nextThreadId);
     clearSessionState();
     setSessionPath(response.messages.length > 0 ? response.thread.session_path || "" : "");
+    await syncActiveRun(nextThreadId);
     return response.messages;
-  }, [clearSessionState]);
+  }, [clearSessionState, syncActiveRun]);
 
   const refreshFiles = useCallback(async () => {
     if (!sessionPath) {
@@ -142,6 +168,14 @@ export function useDeepAgentSession() {
             return;
           }
 
+          const payloadRunId = payload.run_id || extractString(payload.data, "run_id") || "";
+          if (payloadRunId && ignoredRunIdsRef.current.has(payloadRunId)) {
+            return;
+          }
+          if (payloadRunId && currentRunIdRef.current && payloadRunId !== currentRunIdRef.current) {
+            return;
+          }
+
           setEvents((previous) => [...previous, payload].slice(-MAX_EVENTS));
 
           if (payload.event === "session_created") {
@@ -154,18 +188,27 @@ export function useDeepAgentSession() {
           if (payload.event === "task_result") {
             const finalResult = extractString(payload.data, "result");
             setResult(finalResult || payload.message);
+            currentRunIdRef.current = "";
+            setCurrentRunId("");
             setIsRunning(false);
             setIsCancelling(false);
           }
 
           if (payload.event === "task_cancelled") {
+            if (payloadRunId) {
+              ignoredRunIdsRef.current.add(payloadRunId);
+            }
             setResult((previous) => previous || payload.message);
+            currentRunIdRef.current = "";
+            setCurrentRunId("");
             setIsRunning(false);
             setIsCancelling(false);
           }
 
           if (payload.event === "error") {
             setLastError(payload.message);
+            currentRunIdRef.current = "";
+            setCurrentRunId("");
             setIsRunning(false);
             setIsCancelling(false);
           }
@@ -233,12 +276,21 @@ export function useDeepAgentSession() {
       setEvents([]);
       setResult("");
       setLastError("");
+      if (currentRunIdRef.current) {
+        ignoredRunIdsRef.current.add(currentRunIdRef.current);
+        currentRunIdRef.current = "";
+        setCurrentRunId("");
+      }
       try {
         const response = await startTask(cleanQuery, threadId);
         if (response.thread_id && response.thread_id !== threadId) {
           storeThreadId(response.thread_id);
           setThreadId(response.thread_id);
         }
+        currentRunIdRef.current = response.run_id;
+        setCurrentRunId(response.run_id);
+        setIsRunning(true);
+        setIsCancelling(false);
         return response;
       } catch (error) {
         setIsRunning(false);
@@ -257,8 +309,15 @@ export function useDeepAgentSession() {
     setIsCancelling(true);
     setLastError("");
     try {
-      const response = await cancelTask(threadId);
+      const runId = currentRunIdRef.current;
+      const response = runId ? await cancelRun(threadId, runId) : await cancelTask(threadId);
       if (response.status === "cancelled") {
+        const cancelledRunId = response.run_id || runId;
+        if (cancelledRunId) {
+          ignoredRunIdsRef.current.add(cancelledRunId);
+        }
+        currentRunIdRef.current = "";
+        setCurrentRunId("");
         setIsRunning(false);
         setIsCancelling(false);
         setResult((previous) => previous || "任务已取消");
@@ -327,6 +386,7 @@ export function useDeepAgentSession() {
 
   return {
     connectionState,
+    currentRunId,
     events,
     files,
     isCancelling,

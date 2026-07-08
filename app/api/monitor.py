@@ -13,7 +13,7 @@ from typing import Any, Optional
 from fastapi import WebSocket
 
 from app.api import chat_history
-from app.api.context import get_thread_context
+from app.api.context import get_run_context, get_thread_context
 
 
 class ToolMonitor:
@@ -56,6 +56,10 @@ class ToolMonitor:
             "data": data or {},
             "timestamp": datetime.datetime.now().isoformat(),
         }
+        run_id = get_run_context()
+        if run_id:
+            payload["run_id"] = run_id
+            payload["data"] = {**payload["data"], "run_id": run_id}
 
         if self.websocket_manager:
             try:
@@ -126,17 +130,15 @@ class ToolMonitor:
 
     def report_task_result(self, result: str) -> None:
         """报告任务最终结果"""
-        thread_id = get_thread_context()
-        if thread_id:
+        run_id = get_run_context()
+        if run_id:
             try:
-                chat_history.append_message(
-                    thread_id,
-                    "assistant",
-                    result,
-                    event_type="task_result",
-                )
+                run = chat_history.get_run(run_id)
+                if run and run.get("status") == "interrupted":
+                    print(f"[Monitor] Skip task_result for interrupted run: {run_id}")
+                    return
             except Exception as exc:
-                print(f"[Monitor] Chat history persist failed: {exc}")
+                print(f"[Monitor] Run status check failed: {exc}")
         self._emit("task_result", "任务执行完成", {"result": result})
 
     def report_task_cancelled(self) -> None:
